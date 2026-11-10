@@ -213,6 +213,13 @@ def series_name(name):
     return base or (name or "")
 
 
+def base_name(name):
+    """Seriya guruhi uchun asosiy nom: qism/final va oxiridagi yalang'ich raqamni oladi."""
+    b = series_name(name)
+    b = re.sub(r"[\s\-–—:]+\d{1,3}$", "", b).strip(" -–—:•|")
+    return b or (name or "")
+
+
 def clean_caption(text):
     """Izohdagi kanal reklamasi (@username, t.me, 'kanalidan olindi') satrlarini olib tashlaydi."""
     if not text:
@@ -478,37 +485,42 @@ async def run_forward(user, source_ref, dest_ref, prog):
     await prog.edit_text("⏳ Kinolar ko'chirilmoqda... (/stop, /pause)")
 
     src_msgs = [m async for m in user.get_chat_history(src_chat.id, limit=SCAN_LIMIT)]
-    for m in reversed(src_msgs):
+    items = []
+    counts = {}
+    for m in src_msgs:
+        if not is_video(m):
+            continue
+        media_obj = m.video or m.document
+        size = getattr(media_obj, "file_size", 0) or 0
+        if size and size < MIN_MOVIE_SIZE:
+            continue
+        name = extract_name(m.caption or "")
+        if src_is_forum:
+            base = src_topic_titles.get(getattr(m, "message_thread_id", None)) or "Kinolar"
+        else:
+            base = base_name(name)
+        key = norm_name(base)
+        counts[key] = counts.get(key, 0) + 1
+        items.append((m, name, base, key))
+
+    for m, name, base, key in reversed(items):
         if CONTROL["stop"]:
             break
         while CONTROL["pause"] and not CONTROL["stop"]:
             await asyncio.sleep(1)
         if CONTROL["stop"]:
             break
-        if not is_video(m):
-            continue
-        media_obj = m.video or m.document
-        size = getattr(media_obj, "file_size", 0) or 0
-        if size and size < MIN_MOVIE_SIZE:
-            skipped += 1
-            continue
-        name = extract_name(m.caption or "")
         ep_key = norm_name(name)
         if ep_key and ep_key in existing:
             skipped += 1
             continue
-        if src_is_forum:
-            base = src_topic_titles.get(getattr(m, "message_thread_id", None)) or "Kinolar"
-        elif EP_RE.search(name) or FINAL_RE.search(name):
-            base = series_name(name)
-        else:
-            base = "Kinolar"
+        topic_base = base if counts.get(key, 0) > 1 else "Kinolar"
         thread_id = None
         if is_forum:
-            skey = norm_name(base)
+            skey = norm_name(topic_base)
             if skey not in topics_map:
                 try:
-                    created = await user.create_forum_topic(dst_real, base[:128])
+                    created = await user.create_forum_topic(dst_real, topic_base[:128])
                     tid = getattr(created, "message_thread_id", None) or created.id
                     topics_map[skey] = tid
                     made += 1
