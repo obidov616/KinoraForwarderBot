@@ -1,0 +1,4 @@
+aiogram>=3.7,<4.0
+kurigram>=2.0
+tgcrypto>=1.2.5
+aiohttp>=3.9
