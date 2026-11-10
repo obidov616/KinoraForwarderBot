@@ -42,6 +42,9 @@ SESSION_FILE = os.getenv("SESSION_FILE", "user_session.txt").strip()
 DATA_FILE = os.getenv("DATA_FILE", "forward_data.json").strip()
 SCAN_LIMIT = _env_int("SCAN_LIMIT", 2000)
 PORT = _env_int("PORT", 10000)
+STORAGE_CHANNEL_ID = _env_int("STORAGE_CHANNEL_ID", 0)
+# Bot API multipart upload chegarasi 50 MB; undan kattasi storage kanal orqali o'tadi
+MAX_BOT_UPLOAD = 50 * 1024 * 1024
 
 if not BOT_TOKEN:
     _fail("BOT_TOKEN env kiritilmagan. BotFather tokenini yozing.")
@@ -81,7 +84,7 @@ from aiogram.filters import Command, CommandStart, Filter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (CallbackQuery, InlineKeyboardButton,
+from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton,
                            InlineKeyboardMarkup, KeyboardButton, Message,
                            ReplyKeyboardMarkup)
 from pyrogram import Client
@@ -179,6 +182,13 @@ def extract_name(text):
 
 def norm_name(name):
     return re.sub(r"\s+", " ", (name or "").strip().casefold())
+
+
+def is_video(m):
+    if m.video:
+        return True
+    doc = m.document
+    return bool(doc and (doc.mime_type or "").startswith("video/"))
 
 
 def clean_caption(text):
@@ -293,7 +303,9 @@ async def cmd_help(m: Message):
         "🎬 <b>Yordam</b>\n\n"
         "🔄 <b>Avto forward</b> — manba kanaldagi kinolarni manzil kanalda yo'qlarini "
         "aniqlab, nom bo'yicha mavzu yaratib ko'chiradi (reklama tozalanadi, yuboruvchi yashiriladi).\n"
-        "📥 <b>Video yuklash</b> — post havolasini yuborsangiz, media Saved Messages ga tez ko'chiriladi.\n\n"
+        "📥 <b>Video yuklash</b> — post havolasi yoki ID orqali media shu bot chatiga tushadi.\n\n"
+        "⚙️ Katta fayllar (50 MB+) uchun: yopiq kanal yarating, botni admin qiling, "
+        "kanal ID sini STORAGE_CHANNEL_ID env ga yozing.\n\n"
         "Buyruqlar:\n"
         "/login — user session ulash\n"
         "/cancel — joriy amalni bekor qilish\n"
@@ -304,9 +316,11 @@ async def cmd_help(m: Message):
 @dp.message(Command("status"))
 async def cmd_status(m: Message):
     holat = "✅ faol" if get_user() is not None else "❌ yo'q"
+    storage = f"✅ {STORAGE_CHANNEL_ID}" if STORAGE_CHANNEL_ID else "❌ (50 MB gacha)"
     await m.answer(
         f"📊 <b>Holat</b>\n\nUser session: {holat}\n"
-        f"Owner ID: <code>{OWNER_ID}</code>\nSkaner limiti: {SCAN_LIMIT} post",
+        f"Owner ID: <code>{OWNER_ID}</code>\nSkaner limiti: {SCAN_LIMIT} post\n"
+        f"Storage kanal: {storage}",
         reply_markup=main_menu())
 
 
@@ -402,6 +416,8 @@ async def run_forward(user, source_ref, dest_ref, prog):
 
     existing = set()
     async for m in user.get_chat_history(dst_real, limit=SCAN_LIMIT):
+        if not is_video(m):
+            continue
         nm = extract_name(m.caption or m.text or "")
         if nm:
             existing.add(norm_name(nm))
@@ -413,7 +429,7 @@ async def run_forward(user, source_ref, dest_ref, prog):
     await prog.edit_text("⏳ Kinolar ko'chirilmoqda...")
 
     async for m in user.get_chat_history(src_chat.id, limit=SCAN_LIMIT):
-        if not m.media:
+        if not is_video(m):
             continue
         name = extract_name(m.caption or "")
         key = norm_name(name)
@@ -473,8 +489,11 @@ async def download_entry(m: Message, state: FSMContext):
     await m.answer(
         "📥 <b>Video yuklash</b>\n\n"
         "Kerakli post havolasini yuboring:\n"
-        "Masalan: https://t.me/c/1234567890/123 yoki https://t.me/kanal/456\n\n"
-        "Media Saved Messages ga tez ko'chiriladi. Bekor: /cancel")
+        "• https://t.me/c/1234567890/123\n"
+        "• https://t.me/kanal/456\n"
+        "• yoki ID bilan: <code>-1001234567890 123</code>\n\n"
+        "Kanal, guruh, yopiq kanal/guruh — hammasidan oladi (a'zo bo'lsangiz).\n"
+        "Media shu bot chatiga tushadi. Bekor: /cancel")
 
 
 @dp.message(DownloadFlow.link, F.text)
@@ -484,21 +503,67 @@ async def download_link(m: Message, state: FSMContext):
     await state.clear()
     if user is None:
         return await m.answer("⚠️ User session yo'q. Avval /login qiling.", reply_markup=main_menu())
-    chat_ref, msg_id = resolve_chat(ref)
-    prog = await m.answer("⏳ Media ko'chirilmoqda...")
+    parts = ref.split()
+    if len(parts) >= 2 and parts[-1].isdigit():
+        chat_ref, _ = resolve_chat(" ".join(parts[:-1]))
+        msg_id = int(parts[-1])
+    else:
+        chat_ref, msg_id = resolve_chat(ref)
+    prog = await m.answer("⏳ Media olinmoqda...")
     try:
         chat = await user.get_chat(chat_ref)
         if not msg_id:
             await prog.edit_text(
-                "⚠️ Havolada post ID yo'q. Aniq post havolasini yuboring (masalan t.me/c/.../123).")
+                "⚠️ Post ID yo'q. Aniq post havolasini yuboring (t.me/c/.../123) "
+                "yoki ID bilan: -1001234567890 123")
             return await m.answer("🏠 Bosh menyu", reply_markup=main_menu())
-        await user.copy_message("me", chat.id, msg_id)
-        await prog.edit_text("✅ <b>Tayyor!</b> Media Saved Messages ga ko'chirildi.")
+        msg = await user.get_messages(chat.id, msg_id)
+        if not msg or not msg.media:
+            await prog.edit_text("⚠️ Bu postda media topilmadi.")
+            return await m.answer("🏠 Bosh menyu", reply_markup=main_menu())
+        if STORAGE_CHANNEL_ID:
+            await user.copy_message(STORAGE_CHANNEL_ID, chat.id, msg_id)
+            await prog.edit_text("✅ <b>Tayyor!</b> Media bot chatiga yuborilmoqda.")
+        else:
+            media_obj = (msg.video or msg.document or msg.audio or msg.animation
+                         or msg.voice or msg.video_note or msg.photo)
+            size = getattr(media_obj, "file_size", 0) or 0
+            if size > MAX_BOT_UPLOAD:
+                await prog.edit_text(
+                    "⚠️ Fayl 50 MB dan katta — bot to'g'ridan-to'g'ri yuklay olmaydi.\n"
+                    "Katta fayllar uchun STORAGE_CHANNEL_ID ni sozlang (qo'llanma /help).")
+                return await m.answer("🏠 Bosh menyu", reply_markup=main_menu())
+            path = await user.download_media(msg)
+            try:
+                if msg.video:
+                    await bot.send_video(OWNER_ID, FSInputFile(path))
+                else:
+                    await bot.send_document(OWNER_ID, FSInputFile(path))
+                await prog.edit_text("✅ <b>Tayyor!</b> Media bot chatiga yuborildi.")
+            finally:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
     except Exception as exc:
         await prog.edit_text(
             f"❌ Xatolik: {type(exc).__name__}: {str(exc)[:200]}\n"
             "User ushbu kanal/guruhga a'zo ekanini tekshiring.")
     await m.answer("🏠 Bosh menyu", reply_markup=main_menu())
+
+
+@dp.channel_post()
+async def storage_relay(m: Message):
+    if not STORAGE_CHANNEL_ID or m.chat.id != STORAGE_CHANNEL_ID:
+        return
+    try:
+        await bot.copy_message(OWNER_ID, STORAGE_CHANNEL_ID, m.message_id)
+    except Exception:
+        pass
+    try:
+        await bot.delete_message(STORAGE_CHANNEL_ID, m.message_id)
+    except Exception:
+        pass
 
 
 # ================== USER SESSION LOGIN ==================
@@ -526,7 +591,11 @@ async def login_phone(m: Message, state: FSMContext):
         sent = await client.send_code(phone)
         LOGIN[m.from_user.id] = {"client": client, "phone": phone, "hash": sent.phone_code_hash}
         await state.set_state(LoginFlow.code)
-        await m.answer("📩 Telegram yuborgan <b>kodni</b> kiriting:")
+        await m.answer(
+            "📩 Telegram yuborgan <b>kodni</b> kiriting.\n\n"
+            "💡 Maslahat: raqamlar orasiga <b>nuqta</b> qo'yib yozing "
+            "(masalan <code>1.2.3.4.5</code>) yoki oddiy <code>12345</code> — "
+            "bot keraksiz belgilarni o'zi tozalaydi.")
     except Exception as exc:
         await login_cleanup(m.from_user.id)
         await m.answer(f"❌ Kod yuborishda xato: {type(exc).__name__}: {str(exc)[:160]}")
@@ -534,7 +603,9 @@ async def login_phone(m: Message, state: FSMContext):
 
 @dp.message(LoginFlow.code, F.text)
 async def login_code(m: Message, state: FSMContext):
-    code = m.text.strip()
+    code = re.sub(r"\D", "", m.text)
+    if not code:
+        return await m.answer("❌ Kodda raqam yo'q. Masalan: 1.2.3.4.5 yoki 12345")
     rec = LOGIN.get(m.from_user.id)
     if not rec:
         await state.clear()
