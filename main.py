@@ -191,6 +191,21 @@ def is_video(m):
     return bool(doc and (doc.mime_type or "").startswith("video/"))
 
 
+EP_RE = re.compile(
+    r"\b(?:qism|qismi|episode|episodes|ep|seriya|series|part|son)\s*[-#:]?\s*\d{1,4}\b"
+    r"|\b\d{1,4}\s*[-]?\s*(?:qism|qismi|episode|ep|seriya|series|part|son)\b"
+    r"|\bS\d{1,2}\s*E\d{1,3}\b"
+    r"|\bE\d{1,3}\b",
+    re.IGNORECASE)
+
+
+def series_name(name):
+    """Qism raqamini olib tashlab, asosiy kino/anime nomini qaytaradi (bitta mavzu uchun)."""
+    base = EP_RE.sub("", name or "")
+    base = re.sub(r"\s+", " ", base).strip(" -–—:•|")
+    return base or (name or "")
+
+
 def clean_caption(text):
     """Izohdagi kanal reklamasi (@username, t.me, 'kanalidan olindi') satrlarini olib tashlaydi."""
     if not text:
@@ -432,22 +447,24 @@ async def run_forward(user, source_ref, dest_ref, prog):
         if not is_video(m):
             continue
         name = extract_name(m.caption or "")
-        key = norm_name(name)
-        if key and key in existing:
+        ep_key = norm_name(name)
+        if ep_key and ep_key in existing:
             skipped += 1
             continue
         thread_id = None
         if is_forum and name:
-            if key not in topics_map:
+            base = series_name(name)
+            skey = norm_name(base)
+            if skey not in topics_map:
                 try:
-                    created = await user.create_forum_topic(dst_real, name[:128])
+                    created = await user.create_forum_topic(dst_real, base[:128])
                     tid = getattr(created, "message_thread_id", None) or created.id
-                    topics_map[key] = tid
+                    topics_map[skey] = tid
                     made += 1
                     save_data()
                 except Exception:
-                    topics_map[key] = None
-            thread_id = topics_map.get(key)
+                    topics_map[skey] = None
+            thread_id = topics_map.get(skey)
         kw = {}
         if m.caption is not None:
             kw["caption"] = clean_caption(m.caption)
@@ -456,8 +473,8 @@ async def run_forward(user, source_ref, dest_ref, prog):
         try:
             await user.copy_message(dst_real, src_chat.id, m.id, **kw)
             copied += 1
-            if key:
-                existing.add(key)
+            if ep_key:
+                existing.add(ep_key)
         except pg_errors.FloodWait as e:
             await asyncio.sleep(int(e.value) + 1)
             try:
@@ -518,21 +535,22 @@ async def download_link(m: Message, state: FSMContext):
                 "yoki ID bilan: -1001234567890 123")
             return await m.answer("🏠 Bosh menyu", reply_markup=main_menu())
         msg = await user.get_messages(chat.id, msg_id)
-        if not msg or not msg.media:
-            await prog.edit_text("⚠️ Bu postda media topilmadi.")
+        media_obj = None
+        if msg:
+            media_obj = (msg.video or msg.document or msg.photo or msg.audio
+                         or msg.animation or msg.voice or msg.video_note or msg.sticker)
+        if not media_obj:
+            await prog.edit_text(
+                f"⚠️ Media topilmadi.\nChat: {he(str(chat.title or chat.id))} "
+                f"(<code>{chat.id}</code>), post: {msg_id}.\n"
+                "Aniq post havolasini yuboring (t.me/c/.../123) yoki ID: -100... 123")
             return await m.answer("🏠 Bosh menyu", reply_markup=main_menu())
-        if STORAGE_CHANNEL_ID:
+        size = getattr(media_obj, "file_size", 0) or 0
+        protected = bool(getattr(chat, "has_protected_content", False))
+        if STORAGE_CHANNEL_ID and not protected:
             await user.copy_message(STORAGE_CHANNEL_ID, chat.id, msg_id)
             await prog.edit_text("✅ <b>Tayyor!</b> Media bot chatiga yuborilmoqda.")
-        else:
-            media_obj = (msg.video or msg.document or msg.audio or msg.animation
-                         or msg.voice or msg.video_note or msg.photo)
-            size = getattr(media_obj, "file_size", 0) or 0
-            if size > MAX_BOT_UPLOAD:
-                await prog.edit_text(
-                    "⚠️ Fayl 50 MB dan katta — bot to'g'ridan-to'g'ri yuklay olmaydi.\n"
-                    "Katta fayllar uchun STORAGE_CHANNEL_ID ni sozlang (qo'llanma /help).")
-                return await m.answer("🏠 Bosh menyu", reply_markup=main_menu())
+        elif size <= MAX_BOT_UPLOAD:
             path = await user.download_media(msg)
             try:
                 if msg.video:
@@ -545,6 +563,24 @@ async def download_link(m: Message, state: FSMContext):
                     os.remove(path)
                 except Exception:
                     pass
+        elif STORAGE_CHANNEL_ID:
+            path = await user.download_media(msg)
+            try:
+                if msg.video:
+                    await user.send_video(STORAGE_CHANNEL_ID, path)
+                else:
+                    await user.send_document(STORAGE_CHANNEL_ID, path)
+                await prog.edit_text("✅ <b>Tayyor!</b> Media bot chatiga yuborilmoqda.")
+            finally:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+        else:
+            await prog.edit_text(
+                "⚠️ Fayl 50 MB dan katta — bot to'g'ridan-to'g'ri yuklay olmaydi.\n"
+                "Katta fayllar uchun STORAGE_CHANNEL_ID ni sozlang (qo'llanma /help).")
+            return await m.answer("🏠 Bosh menyu", reply_markup=main_menu())
     except Exception as exc:
         await prog.edit_text(
             f"❌ Xatolik: {type(exc).__name__}: {str(exc)[:200]}\n"
