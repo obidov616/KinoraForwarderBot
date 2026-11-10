@@ -45,6 +45,8 @@ PORT = _env_int("PORT", 10000)
 STORAGE_CHANNEL_ID = _env_int("STORAGE_CHANNEL_ID", 0)
 # Bot API multipart upload chegarasi 50 MB; undan kattasi storage kanal orqali o'tadi
 MAX_BOT_UPLOAD = 50 * 1024 * 1024
+MIN_MOVIE_MB = _env_int("MIN_MOVIE_MB", 50)
+MIN_MOVIE_SIZE = MIN_MOVIE_MB * 1024 * 1024
 
 if not BOT_TOKEN:
     _fail("BOT_TOKEN env kiritilmagan. BotFather tokenini yozing.")
@@ -199,9 +201,14 @@ EP_RE = re.compile(
     re.IGNORECASE)
 
 
+FINAL_RE = re.compile(r"\b(?:final|yakun|yakuniy|oxirgi|yakunlovchi)\b", re.IGNORECASE)
+
+
 def series_name(name):
-    """Qism raqamini olib tashlab, asosiy kino/anime nomini qaytaradi (bitta mavzu uchun)."""
+    """Qism/final belgilarini olib tashlab, asosiy kino/anime nomini qaytaradi."""
     base = EP_RE.sub("", name or "")
+    base = re.sub(r"(?:\b(?:final|yakun|yakuniy|oxirgi|yakunlovchi)\b[\s\-–—:•|]*)+$",
+                  "", base, flags=re.IGNORECASE)
     base = re.sub(r"\s+", " ", base).strip(" -–—:•|")
     return base or (name or "")
 
@@ -224,6 +231,7 @@ def clean_caption(text):
 
 user_client = None
 LOGIN = {}
+CONTROL = {"stop": False, "pause": False}
 
 
 def read_saved_session():
@@ -324,6 +332,8 @@ async def cmd_help(m: Message):
         "Buyruqlar:\n"
         "/login — user session ulash\n"
         "/cancel — joriy amalni bekor qilish\n"
+        "/stop — avto forwardni to'xtatish\n"
+        "/pause — avto forwardni pauza/davom\n"
         "/status — holatni ko'rish",
         reply_markup=main_menu())
 
@@ -344,6 +354,20 @@ async def cancel_cmd(m: Message, state: FSMContext):
     await login_cleanup(m.from_user.id)
     await state.clear()
     await m.answer("❌ Bekor qilindi.", reply_markup=main_menu())
+
+
+@dp.message(Command("stop"))
+async def cmd_stop(m: Message):
+    CONTROL["stop"] = True
+    CONTROL["pause"] = False
+    await m.answer("🛑 Avto forward to'xtatildi.", reply_markup=main_menu())
+
+
+@dp.message(Command("pause"))
+async def cmd_pause(m: Message):
+    CONTROL["pause"] = not CONTROL["pause"]
+    await m.answer("⏸ Pauza qilindi." if CONTROL["pause"] else "▶️ Davom etmoqda.",
+                   reply_markup=main_menu())
 
 
 # ================== AVTO FORWARD ==================
@@ -438,22 +462,49 @@ async def run_forward(user, source_ref, dest_ref, prog):
             existing.add(norm_name(nm))
 
     topics_map = DATA.setdefault("topics", {}).setdefault(str(dst_real), {})
+    CONTROL["stop"] = False
+    CONTROL["pause"] = False
+    src_is_forum = bool(getattr(src_chat, "is_forum", False))
+    src_topic_titles = {}
+    if src_is_forum:
+        try:
+            async for t in user.get_forum_topics(src_chat.id):
+                src_topic_titles[t.id] = t.title or "Mavzu"
+        except Exception:
+            src_topic_titles = {}
     copied = 0
     skipped = 0
     made = 0
-    await prog.edit_text("⏳ Kinolar ko'chirilmoqda...")
+    await prog.edit_text("⏳ Kinolar ko'chirilmoqda... (/stop, /pause)")
 
-    async for m in user.get_chat_history(src_chat.id, limit=SCAN_LIMIT):
+    src_msgs = [m async for m in user.get_chat_history(src_chat.id, limit=SCAN_LIMIT)]
+    for m in reversed(src_msgs):
+        if CONTROL["stop"]:
+            break
+        while CONTROL["pause"] and not CONTROL["stop"]:
+            await asyncio.sleep(1)
+        if CONTROL["stop"]:
+            break
         if not is_video(m):
+            continue
+        media_obj = m.video or m.document
+        size = getattr(media_obj, "file_size", 0) or 0
+        if size and size < MIN_MOVIE_SIZE:
+            skipped += 1
             continue
         name = extract_name(m.caption or "")
         ep_key = norm_name(name)
         if ep_key and ep_key in existing:
             skipped += 1
             continue
-        thread_id = None
-        if is_forum and name:
+        if src_is_forum:
+            base = src_topic_titles.get(getattr(m, "message_thread_id", None)) or "Kinolar"
+        elif EP_RE.search(name) or FINAL_RE.search(name):
             base = series_name(name)
+        else:
+            base = "Kinolar"
+        thread_id = None
+        if is_forum:
             skey = norm_name(base)
             if skey not in topics_map:
                 try:
