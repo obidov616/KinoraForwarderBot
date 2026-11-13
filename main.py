@@ -59,7 +59,7 @@ def default_data():
             "dest_title": "",
             "min_size_mb": 100,
             "movies_topic": "Kinolar",
-            "series_min_episodes": 2,
+            "clean_captions": True,
             "auto": False,
             "auto_interval_min": 30,
         },
@@ -165,6 +165,27 @@ _login_client = None
 _run_lock = asyncio.Lock()
 _client_lock = asyncio.Lock()
 _background_tasks = set()
+_stop_event = asyncio.Event()
+
+
+class ForwardStopped(Exception):
+    pass
+
+
+def request_stop() -> bool:
+    """Forward ketayotgan bo'lsa to'xtatishni so'raydi."""
+    running = _run_lock.locked()
+    _stop_event.set()
+    return running
+
+
+async def _sleep_or_stop(seconds: float) -> bool:
+    """Kutish davomida stop so'ralsa True qaytaradi."""
+    try:
+        await asyncio.wait_for(_stop_event.wait(), timeout=max(0.1, float(seconds)))
+        return True
+    except asyncio.TimeoutError:
+        return False
 
 
 def spawn(coro):
@@ -423,15 +444,24 @@ async def create_topic(client, dest, title: str):
 
 
 async def ensure_topic(client, dest, title: str):
-    topic_id = await find_topic(client, dest, title)
-    if topic_id:
-        return topic_id, False
-    topic_id = await create_topic(client, dest, title)
-    if topic_id:
-        return topic_id, True
-    topic_id = await find_topic(client, dest, title)
-    if topic_id:
-        return topic_id, True
+    for _attempt in range(4):
+        if _stop_event.is_set():
+            raise ForwardStopped()
+        topic_id = await find_topic(client, dest, title)
+        if topic_id:
+            return topic_id, False
+        try:
+            topic_id = await create_topic(client, dest, title)
+        except errors.FloodWaitError as exc:
+            logging.warning("Mavzu yaratishda limit: %s soniya", exc.seconds)
+            if await _sleep_or_stop(int(exc.seconds) + 1):
+                raise ForwardStopped()
+            continue
+        if topic_id:
+            return topic_id, True
+        topic_id = await find_topic(client, dest, title)
+        if topic_id:
+            return topic_id, True
     raise RuntimeError(f"«{title}» mavzusini yaratib bo'lmadi")
 
 
@@ -450,25 +480,45 @@ _SEASON_MARKER_RE = re.compile(
 )
 _HASH_EP_RE = re.compile(r"(?:^|[\s|(])#(\d{1,3})(?=$|[\s|)])")
 _E_RE = re.compile(r"\bE(?:P)?\s*[._-]?\s*(\d{1,3})\b", re.I)
+_EP_LABEL_RE = re.compile(
+    r"\b(?:qism|epizod|episode|seriya|seria|part)\s*[:\-–—]?\s*(\d{1,3})\b", re.I
+)
+_SEASON_LABEL_RE = re.compile(
+    r"\b(?:fasl|sezon|season|mavsum)\s*[:\-–—]?\s*(\d{1,2})\b", re.I
+)
+_LABEL_RE = re.compile(r"\b(?:kino|film|serial|multfilm|multik)\s*nomi\s*[:\-–—]?\s*", re.I)
 _QUALITY_RE = re.compile(
     r"\b(?:\d{3,4}[pi]|4k|8k|uhd|fhd|full\s*hd|hdrip|web[- ]?dl|webrip|hdtv|bluray|brrip|dvdrip|camrip)\b",
     re.I,
 )
 _LANG_RE = re.compile(
-    r"\b(?:uzbek|o['’ʻ]zbek|ozbek|узбек|rus|russian|ruscha|hind|hindi|turk|turkish|"
-    r"tarjima|tarjimon|tilida|dublyaj|dublaj|subtitr(?:i)?)\b",
+    r"\b(?:uzbekcha|o['’ʻ]zbekcha|ozbekcha|uzbek|o['’ʻ]zbek|ozbek|узбек|"
+    r"ruscha|russian|rus|hindcha|hindi|hind|turkcha|turkish|turk|turkiy|"
+    r"tarjima|tarjimon|dublyaj|dublaj|subtitr(?:i)?|"
+    r"tilidagi|tilida|tili|til|"
+    r"sifatli|sifati|sifat|yuklab|olish|premyera|premerasi)\b",
     re.I,
 )
+_RES_RE = re.compile(r"(?<!\d)(?:360|480|720|1080|1440|2160)(?!\d)")
+_HD_RE = re.compile(r"\b(?:hd|fhd|uhd|sd)\b", re.I)
+
+
+def clean_name_text(text: str) -> str:
+    """Nom atrofidagi bezak, tinish belgilari va emojilarni olib tashlaydi."""
+    text = re.sub(r"^[^\w]+", "", str(text or ""), flags=re.UNICODE)
+    text = re.sub(r"[^\w\s]+$", "", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def parse_media_title(raw: str):
-    """Sarlavhadan serial nomi, fasl va qism raqamini ajratadi.
+    """Sarlavhadan kino/serial nomi, fasl va qism raqamini ajratadi.
 
-    «Hovli 1 qism uzbek tilida» -> ("Hovli", None, 1)
+    «Merlin 1 qism til uzbek sifati 1080p» -> ("Merlin", None, 1)
     """
     text = unicodedata.normalize("NFKC", str(raw or ""))
     text = _URL_RE.sub(" ", text)
     text = _EXT_RE.sub(" ", text)
+    text = _LABEL_RE.sub(" ", text)
     text = text.replace("_", " ").replace("|", " ")
 
     season = episode = None
@@ -477,39 +527,97 @@ def parse_media_title(raw: str):
         season, episode = int(match.group(1)), int(match.group(2))
         text = _SE_RE.sub(" ", text)
     else:
-        match = _EP_MARKER_RE.search(text)
+        match = _EP_LABEL_RE.search(text)
         if match:
             episode = int(match.group(1))
-            text = _EP_MARKER_RE.sub(" ", text)
+            text = _EP_LABEL_RE.sub(" ", text)
         else:
-            match = _HASH_EP_RE.search(text)
+            match = _EP_MARKER_RE.search(text)
             if match:
                 episode = int(match.group(1))
-                text = _HASH_EP_RE.sub(" ", text)
+                text = _EP_MARKER_RE.sub(" ", text)
             else:
-                match = _E_RE.search(text)
+                match = _HASH_EP_RE.search(text)
                 if match:
                     episode = int(match.group(1))
-                    text = _E_RE.sub(" ", text)
-        match = _SEASON_MARKER_RE.search(text)
+                    text = _HASH_EP_RE.sub(" ", text)
+                else:
+                    match = _E_RE.search(text)
+                    if match:
+                        episode = int(match.group(1))
+                        text = _E_RE.sub(" ", text)
+        match = _SEASON_LABEL_RE.search(text)
         if match:
             season = int(match.group(1))
-            text = _SEASON_MARKER_RE.sub(" ", text)
+            text = _SEASON_LABEL_RE.sub(" ", text)
+        else:
+            match = _SEASON_MARKER_RE.search(text)
+            if match:
+                season = int(match.group(1))
+                text = _SEASON_MARKER_RE.sub(" ", text)
 
     text = _QUALITY_RE.sub(" ", text)
+    text = _RES_RE.sub(" ", text)
+    text = _HD_RE.sub(" ", text)
     text = _LANG_RE.sub(" ", text)
     text = re.sub(r"#\w+", " ", text)
     text = re.sub(r"(?<!\d)(?:19|20)\d{2}(?!\d)", " ", text)
     text = re.sub(r"[\[\](){}<>«»,;:•·/\\]+", " ", text)
     text = re.sub(r"\s*[-–—.]+\s*", " ", text)
-    text = re.sub(r"\s+", " ", text).strip(" .-–—_")
+    text = clean_name_text(text)
+    if text and text.isupper() and text.isascii():
+        text = text.title()
+    if text and text[0].islower():
+        text = text[0].upper() + text[1:]
     if not text or re.fullmatch(r"[\d\s.+-]+", text):
         return "", season, episode
     return text[:100], season, episode
 
 
 def title_key(title: str) -> str:
-    return re.sub(r"\s+", " ", str(title or "").casefold()).strip()
+    text = unicodedata.normalize("NFKC", str(title or "")).casefold()
+    text = re.sub(r"[^\w\s]+", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+_CAPTION_LINK_RE = re.compile(
+    r"(?:https?://\S+|(?:www\.)?t(?:elegram)?\.me/\S+|@[A-Za-z0-9_]{4,})", re.I
+)
+_AD_LINE_RE = re.compile(
+    r"(?:reklama|obuna|subscribe|kanalga|kanalimiz|hamkorlik|murojaat|\bjoin\b|"
+    r"yuklab\s*olish|yuklab\s*ol\b|skachat|download)",
+    re.I,
+)
+
+
+def _clean_caption_text(text: str) -> str:
+    text = _CAPTION_LINK_RE.sub(" ", str(text or ""))
+    lines = []
+    for line in text.splitlines():
+        if _AD_LINE_RE.search(line):
+            continue
+        line = re.sub(r"[ \t]+", " ", line).strip(" -–—|•·")
+        if line:
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def clean_caption(caption: str, fallback: str = "") -> str:
+    """Tavsifdan reklama havolalari, @username va reklama qatorlarini olib tashlaydi."""
+    text = _clean_caption_text(caption)
+    if not text:
+        text = _clean_caption_text(fallback)
+    return text[:1024]
+
+
+def fallback_name(caption: str, filename: str = "") -> str:
+    candidates = _clean_caption_text(caption).splitlines()
+    candidates.append(str(filename or ""))
+    for line in candidates:
+        parsed, _, _ = parse_media_title(line)
+        if len(re.findall(r"[^\W\d_]", parsed, flags=re.UNICODE)) >= 2:
+            return parsed[:60]
+    return ""
 
 
 def video_document(message):
@@ -542,20 +650,28 @@ async def scan_source(client, source, min_size: int, on_progress=None):
     scanned = 0
     async for message in client.iter_messages(source, reverse=True, wait_time=0.4):
         scanned += 1
+        if _stop_event.is_set():
+            raise ForwardStopped()
         doc = video_document(message)
         if doc is None or int(doc.size or 0) <= min_size:
             continue
         if doc.id in seen_docs:
             continue
         seen_docs.add(doc.id)
-        raw_title = (message.message or "").strip() or document_filename(doc)
-        name, season, episode = parse_media_title(raw_title)
+        caption = (message.message or "").strip()
+        lines = [line.strip() for line in caption.splitlines() if line.strip()]
+        first_line = lines[0] if lines else ""
+        header = " ".join(lines[:3])
+        name, _, _ = parse_media_title(first_line or document_filename(doc))
+        _, season, episode = parse_media_title(header or first_line or document_filename(doc))
+        if not name:
+            name = fallback_name(caption, document_filename(doc))
         items.append({
             "msg_id": message.id,
             "grouped_id": message.grouped_id,
             "doc_id": doc.id,
             "document": doc,
-            "caption": (message.message or "")[:1024],
+            "caption": caption[:1024],
             "size": int(doc.size or 0),
             "name": name,
             "key": title_key(name),
@@ -571,6 +687,8 @@ async def scan_source(client, source, min_size: int, on_progress=None):
 async def existing_doc_ids(client, dest):
     ids = set()
     async for message in client.iter_messages(dest, wait_time=0.4):
+        if _stop_event.is_set():
+            raise ForwardStopped()
         doc = getattr(message, "document", None)
         if doc is not None:
             ids.add(doc.id)
@@ -591,41 +709,48 @@ def chunk_albums(records):
     return batches
 
 
-async def forward_batch(client, source, dest, topic_id, batch):
-    """'forward' — forward qilindi, 'copy' — nusxa yuborildi, '' — xato."""
+async def send_batch(client, source, dest, topic_id, batch, clean: bool):
+    """'copy' — akkaunt o'zi yuborgandek nusxa, 'forward' — muallif yashirilgan forward.
+
+    Nusxa rejimida tavsif tozalanadi va «Forwarded from» yozuvi bo'lmaydi.
+    """
+    captions = [clean_caption(r["caption"], r["name"]) if clean else (r["caption"] or "") for r in batch]
+    files = [record["document"] for record in batch]
+
+    for _attempt in range(3):
+        try:
+            if len(files) == 1:
+                await client.send_file(dest, files[0], caption=captions[0], reply_to=topic_id)
+            else:
+                await client.send_file(dest, files, caption=captions, reply_to=topic_id)
+            return "copy"
+        except errors.FloodWaitError as exc:
+            if await _sleep_or_stop(min(int(exc.seconds) + 1, 900)):
+                return "stopped"
+        except errors.ChatForwardsRestrictedError:
+            break  # media himoyalangan: nusxa ham, forward ham mumkin emas
+        except Exception as exc:
+            logging.warning("Nusxa yuborishda xatolik: %s", exc)
+            break
+
+    # Nusxa ishlamasa, muallifni yashirib forward qilamiz (tavsif o'zgarmaydi).
     ids = [record["msg_id"] for record in batch]
     for _attempt in range(3):
         try:
             await client(functions.messages.ForwardMessagesRequest(
                 from_peer=source, id=ids, to_peer=dest, top_msg_id=topic_id,
+                drop_author=True,
                 random_id=[random.getrandbits(63) for _ in ids],
             ))
             return "forward"
         except errors.FloodWaitError as exc:
-            await asyncio.sleep(min(int(exc.seconds) + 1, 900))
+            if await _sleep_or_stop(min(int(exc.seconds) + 1, 900)):
+                return "stopped"
         except errors.ChatForwardsRestrictedError:
             break
         except Exception as exc:
             logging.warning("Forward xatosi (ids=%s): %s", ids, exc)
             break
-
-    # Forward taqiqlangan bo'lsa, nusxa sifatida yuborishga urinamiz.
-    for attempt in range(2):
-        try:
-            for record in batch:
-                await client.send_file(
-                    dest,
-                    record["document"],
-                    caption=record["caption"] or "",
-                    reply_to=topic_id,
-                )
-            return "copy"
-        except errors.FloodWaitError as exc:
-            await asyncio.sleep(min(int(exc.seconds) + 1, 900))
-        except Exception as exc:
-            logging.warning("Nusxa yuborishda xatolik: %s", exc)
-            if attempt == 1:
-                return ""
     return ""
 
 
@@ -657,6 +782,7 @@ async def run_forward(notify_chat_id=None):
         await _notify(notify_chat_id, "⏳ Forward allaqachon ketmoqda. Tugashini kuting.")
         return None
     async with _run_lock:
+        _stop_event.clear()
         settings = load_data().get("settings", {})
         source_ref = str(settings.get("source") or "").strip()
         dest_ref = str(settings.get("dest") or "").strip()
@@ -694,89 +820,112 @@ async def run_forward(notify_chat_id=None):
         min_mb = max(0, int(settings.get("min_size_mb", 100) or 100))
         min_size = min_mb * 1024 * 1024
         movies_topic = str(settings.get("movies_topic") or "Kinolar").strip() or "Kinolar"
-        min_eps = max(2, int(settings.get("series_min_episodes", 2) or 2))
+        clean_captions = bool(settings.get("clean_captions", True))
 
-        await set_status("🔎 Manzil kanaldagi mavjud fayllar tekshirilmoqda…")
+        items = []
+        scanned_count = 0
+        existing = set()
+        skipped_existing = 0
+        forwarded = copied = failed = created_topics = 0
+        stopped = False
+
         try:
-            existing = await existing_doc_ids(client, dest)
-        except Exception as exc:
-            await set_status(f"❌ Manzil kanalni o'qib bo'lmadi: <code>{_esc(str(exc))}</code>")
-            return None
-        for doc_id in (load_data().get("copied", {}) or {}):
+            await set_status("🔎 Manzil kanaldagi mavjud fayllar tekshirilmoqda…")
             try:
-                existing.add(int(doc_id))
-            except (TypeError, ValueError):
-                continue
-
-        async def scan_progress(scanned, found):
-            await set_status(
-                f"📤 Manba skanerlanmoqda…\n"
-                f"Ko'rildi: <b>{scanned}</b> xabar\n"
-                f"{min_mb} MB dan katta video: <b>{found}</b> ta"
-            )
-
-        await set_status("📤 Manba kanal skanerlanmoqda…")
-        try:
-            items, scanned_count = await scan_source(client, source, min_size, scan_progress)
-        except Exception as exc:
-            await set_status(f"❌ Manba kanalni o'qib bo'lmadi: <code>{_esc(str(exc))}</code>")
-            return None
-
-        skipped_existing = sum(1 for item in items if item["doc_id"] in existing)
-        pending = [item for item in items if item["doc_id"] not in existing]
-
-        # Serial ekanini butun manba bo'yicha aniqlaymiz (kanalda avvaldan bor qismlar ham hisobga olinadi).
-        counts = Counter(
-            item["key"] for item in items if item["key"] and item["episode"] is not None
-        )
-        groups = defaultdict(list)
-        for item in pending:
-            is_series = bool(item["key"]) and item["episode"] is not None and counts[item["key"]] >= min_eps
-            topic_title = item["name"] if is_series else movies_topic
-            groups[topic_title].append(item)
-
-        for records in groups.values():
-            records.sort(key=lambda r: (
-                r["season"] or 0,
-                r["episode"] if r["episode"] is not None else 10 ** 6,
-                r["date"],
-                r["msg_id"],
-            ))
-
-        forwarded = 0
-        copied = 0
-        failed = 0
-        created_topics = 0
-        for topic_title, records in groups.items():
-            try:
-                topic_id, was_created = await ensure_topic(client, dest, topic_title)
+                existing = await existing_doc_ids(client, dest)
+            except ForwardStopped:
+                raise
             except Exception as exc:
-                logging.exception("Mavzu xatosi: %s", exc)
-                failed += len(records)
-                continue
-            if was_created:
-                created_topics += 1
+                await set_status(f"❌ Manzil kanalni o'qib bo'lmadi: <code>{_esc(str(exc))}</code>")
+                return None
+            for doc_id in (load_data().get("copied", {}) or {}):
+                try:
+                    existing.add(int(doc_id))
+                except (TypeError, ValueError):
+                    continue
 
-            for batch in chunk_albums(records):
-                result = await forward_batch(client, source, dest, topic_id, batch)
-                if result == "forward":
-                    forwarded += len(batch)
-                    existing.update(record["doc_id"] for record in batch)
-                elif result == "copy":
-                    copied += len(batch)
-                    existing.update(record["doc_id"] for record in batch)
-                    remember_copies(batch)
-                else:
-                    failed += len(batch)
-                done = forwarded + copied
-                if done and done % 25 < len(batch):
-                    await set_status(
-                        f"📤 Yuborilmoqda…\n✅ Forward: <b>{forwarded}</b> ta\n"
-                        f"📋 Nusxa: <b>{copied}</b> ta\n"
-                        f"🏷 Mavzu: {_esc(topic_title)}"
-                    )
+            async def scan_progress(scanned, found):
+                await set_status(
+                    f"📤 Manba skanerlanmoqda…\n"
+                    f"Ko'rildi: <b>{scanned}</b> xabar\n"
+                    f"{min_mb} MB dan katta video: <b>{found}</b> ta"
+                )
+
+            await set_status("📤 Manba kanal skanerlanmoqda…")
+            try:
+                items, scanned_count = await scan_source(client, source, min_size, scan_progress)
+            except ForwardStopped:
+                raise
+            except Exception as exc:
+                await set_status(f"❌ Manba kanalni o'qib bo'lmadi: <code>{_esc(str(exc))}</code>")
+                return None
+
+            skipped_existing = sum(1 for item in items if item["doc_id"] in existing)
+            pending = [item for item in items if item["doc_id"] not in existing]
+
+            # Har bir kino/serial nomi — alohida mavzu. Faqat nomi aniqlanmaganlar «Kinolar» ga tushadi.
+            groups = defaultdict(list)
+            group_titles = defaultdict(Counter)
+            for item in pending:
+                title = item["name"] or movies_topic
+                key = title_key(title)
+                groups[key].append(item)
+                group_titles[key][title] += 1
+
+            for records in groups.values():
+                records.sort(key=lambda r: (
+                    r["season"] or 0,
+                    r["episode"] if r["episode"] is not None else 10 ** 6,
+                    r["date"],
+                    r["msg_id"],
+                ))
+
+            for key, records in groups.items():
+                if _stop_event.is_set():
+                    stopped = True
+                    break
+                topic_title = group_titles[key].most_common(1)[0][0] or movies_topic
+                try:
+                    topic_id, was_created = await ensure_topic(client, dest, topic_title)
+                except ForwardStopped:
+                    raise
+                except Exception as exc:
+                    logging.exception("Mavzu xatosi: %s", exc)
+                    failed += len(records)
+                    continue
+                if was_created:
+                    created_topics += 1
+
+                for batch in chunk_albums(records):
+                    if _stop_event.is_set():
+                        stopped = True
+                        break
+                    result = await send_batch(client, source, dest, topic_id, batch, clean_captions)
+                    if result == "stopped":
+                        stopped = True
+                        break
+                    if result == "copy":
+                        copied += len(batch)
+                        existing.update(record["doc_id"] for record in batch)
+                        remember_copies(batch)
+                    elif result == "forward":
+                        forwarded += len(batch)
+                        existing.update(record["doc_id"] for record in batch)
+                    else:
+                        failed += len(batch)
+                    done = forwarded + copied
+                    if done and done % 25 < len(batch):
+                        await set_status(
+                            f"📤 Yuborilmoqda…\n✅ Yuborildi: <b>{done}</b> ta\n"
+                            f"🏷 Mavzu: {_esc(topic_title)}"
+                        )
+                if stopped:
+                    break
+        except ForwardStopped:
+            stopped = True
 
         elapsed = int(time.time() - started)
+        total_sent = forwarded + copied
         stats = {
             "last_run": now_ts(),
             "scanned": scanned_count,
@@ -786,6 +935,7 @@ async def run_forward(notify_chat_id=None):
             "skipped_existing": skipped_existing,
             "failed": failed,
             "topics_created": created_topics,
+            "stopped": stopped,
             "elapsed": elapsed,
             "source_title": channel_title(source),
             "dest_title": channel_title(dest),
@@ -795,19 +945,20 @@ async def run_forward(notify_chat_id=None):
         save_data(data)
 
         summary = (
-            f"🏁 <b>Forward tugadi</b>\n"
+            f"{'⏹ <b>Forward to‘xtatildi</b>' if stopped else '🏁 <b>Forward tugadi</b>'}\n"
             f"📥 Ko'rilgan xabar: {scanned_count}\n"
             f"🎬 {min_mb} MB dan katta video: {len(items)}\n"
-            f"✅ Yuborildi: <b>{forwarded}</b>\n"
-            f"📋 Nusxa sifatida: {copied}\n"
+            f"✅ Yuborildi: <b>{total_sent}</b>\n"
             f"♻️ Allaqachon bor (o'tkazildi): {skipped_existing}\n"
             f"🆕 Yangi mavzular: {created_topics}\n"
             f"⚠️ Xatolar: {failed}\n"
             f"⏱ Vaqt: {elapsed} soniya"
         )
+        if stopped:
+            summary += "\n\n▶️ Qayta boshlaganda yuborilganlar o'tkazib yuboriladi."
         if notify_chat_id:
             await set_status(summary)
-        elif forwarded or failed:
+        elif total_sent or failed or stopped:
             await _notify(OWNER_ID, "🔄 <b>Avto-forward</b>\n" + summary)
         return stats
 
@@ -837,7 +988,6 @@ class Form(StatesGroup):
     dest = State()
     min_size = State()
     movies_topic = State()
-    series_min = State()
     interval = State()
 
 
@@ -848,6 +998,7 @@ def panel_text():
     api_id, api_hash = get_api()
     linked = "✅ ulangan" if get_session() else "❌ ulanmagan"
     auto = "🟢 yoqilgan" if settings.get("auto") else "🔴 o'chirilgan"
+    cleaning = "🟢 yoqilgan" if settings.get("clean_captions", True) else "🔴 o'chirilgan"
     lines = [
         "🤖 <b>Avto-Forward bot</b>",
         "",
@@ -856,16 +1007,22 @@ def panel_text():
         f"📥 Manba: {_esc(settings.get('source_title') or settings.get('source') or 'tanlanmagan')}",
         f"📤 Manzil: {_esc(settings.get('dest_title') or settings.get('dest') or 'tanlanmagan')}",
         f"📦 Minimal hajm: {settings.get('min_size_mb', 100)} MB",
-        f"🎬 Kinolar mavzusi: {_esc(settings.get('movies_topic') or 'Kinolar')}",
+        f"🧽 Reklamani tozalash: {cleaning}",
         f"🔁 Avto: {auto} (har {settings.get('auto_interval_min', 30)} daqiqa)",
     ]
     if stats:
+        total = int(stats.get("forwarded", 0) or 0) + int(stats.get("copied", 0) or 0)
         lines += [
             "",
             f"🕒 Oxirgi ishga tushish: {fmt_date(stats.get('last_run'))}",
-            f"✅ Oxirgi forward: {stats.get('forwarded', 0)} ta",
+            f"✅ Oxirgi yuborilgan: {total} ta"
+            + (" (⏹ to'xtatilgan)" if stats.get("stopped") else ""),
         ]
-    lines += ["", "Kanallar nomli mavzularga ajratib forward qilinadi."]
+    lines += [
+        "",
+        "Har bir kino nomi bo'yicha alohida mavzu ochiladi; o'sha nomdagi barcha qismlar shu mavzuga tushadi.",
+        "Xabarlar akkauntning o'zi yuborgandek (forward yozuvisiz) ketadi.",
+    ]
     return "\n".join(lines)
 
 
@@ -873,7 +1030,7 @@ def panel_kb():
     settings = load_data()["settings"]
     linked = bool(get_session())
     auto = bool(settings.get("auto"))
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(
             text=("👤 Akkaunt: ulangan" if linked else "🔐 Akkauntga kirish"),
             callback_data="account",
@@ -884,12 +1041,14 @@ def panel_kb():
         ],
         [InlineKeyboardButton(text="⚙️ Sozlamalar", callback_data="cfg")],
         [InlineKeyboardButton(text="🚀 Forwardni boshlash", callback_data="run_now")],
+        [InlineKeyboardButton(text="⏹ To'xtatish", callback_data="stop_run")],
         [InlineKeyboardButton(
             text=("🟢 Avto: YOQILGAN" if auto else "🔴 Avto: O'CHIRILGAN"),
             callback_data="toggle_auto",
         )],
         [InlineKeyboardButton(text="📊 Statistika", callback_data="stats")],
-    ])
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def account_kb(linked: bool):
@@ -905,10 +1064,11 @@ def account_kb(linked: bool):
 
 def cfg_kb():
     settings = load_data()["settings"]
+    cleaning = "🟢 yoqilgan" if settings.get("clean_captions", True) else "🔴 o'chirilgan"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"📦 Minimal hajm: {settings.get('min_size_mb', 100)} MB", callback_data="cfg:min_size")],
-        [InlineKeyboardButton(text=f"🎬 Kinolar mavzusi: {settings.get('movies_topic', 'Kinolar')}", callback_data="cfg:movies_topic")],
-        [InlineKeyboardButton(text=f"🔢 Serial uchun minimal qism: {settings.get('series_min_episodes', 2)}", callback_data="cfg:series_min")],
+        [InlineKeyboardButton(text=f"🎬 Bo'sh nom uchun mavzu: {settings.get('movies_topic', 'Kinolar')}", callback_data="cfg:movies_topic")],
+        [InlineKeyboardButton(text=f"🧽 Reklamani tozalash: {cleaning}", callback_data="cfg:clean")],
         [InlineKeyboardButton(text=f"🔁 Avto oraliq: {settings.get('auto_interval_min', 30)} daqiqa", callback_data="cfg:interval")],
         [InlineKeyboardButton(text="🧹 Statistika va holatni tozalash", callback_data="reset_stats")],
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="panel")],
@@ -953,6 +1113,29 @@ async def cancel_handler(message: Message, state: FSMContext):
     await state.clear()
     await login_abort()
     await message.answer("✅ Bekor qilindi.", reply_markup=panel_kb())
+
+
+@dp.message(Command("stop"))
+async def stop_command(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    if request_stop():
+        await message.answer(
+            "⏹ To'xtatilmoqda… Joriy fayl yuborilgach to'xtaydi.",
+            reply_markup=panel_kb(),
+        )
+    else:
+        await message.answer("Hozir forward ketmayapti.", reply_markup=panel_kb())
+
+
+@dp.callback_query(F.data == "stop_run")
+async def stop_run_cb(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Shaxsiy bot", show_alert=True)
+    if request_stop():
+        await call.answer("⏹ To'xtatilmoqda…", show_alert=True)
+    else:
+        await call.answer("Hozir forward ketmayapti", show_alert=True)
 
 
 @dp.callback_query(F.data == "panel")
@@ -1286,10 +1469,20 @@ async def cfg_prompt(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await call.answer("⛔ Shaxsiy bot", show_alert=True)
     key = call.data.split(":", 1)[1]
+    if key == "clean":
+        data = load_data()
+        data["settings"]["clean_captions"] = not bool(data["settings"].get("clean_captions", True))
+        save_data(data)
+        enabled = "yoqildi" if data["settings"]["clean_captions"] else "o'chirildi"
+        await call.answer(f"🧽 Reklamani tozalash {enabled}")
+        try:
+            await call.message.edit_text("⚙️ <b>Sozlamalar</b>", reply_markup=cfg_kb())
+        except Exception:
+            await call.message.answer("⚙️ <b>Sozlamalar</b>", reply_markup=cfg_kb())
+        return
     prompts = {
         "min_size": ("min_size", Form.min_size, "📦 Minimal video hajmini MB da yuboring (masalan 100):"),
-        "movies_topic": ("movies_topic", Form.movies_topic, "🎬 Bir qismli kino va filmlar uchun mavzu nomini yuboring (masalan Kinolar):"),
-        "series_min": ("series_min", Form.series_min, "🔢 Serial alohida mavzu ochilishi uchun minimal qism sonini yuboring (kamida 2):"),
+        "movies_topic": ("movies_topic", Form.movies_topic, "🎬 Nomi aniqlanmagan fayllar uchun mavzu nomini yuboring (masalan Kinolar):"),
         "interval": ("interval", Form.interval, "🔁 Avto tekshiruv oralig'ini daqiqada yuboring (kamida 5):"),
     }
     if key not in prompts:
@@ -1305,12 +1498,6 @@ async def cfg_prompt(call: CallbackQuery, state: FSMContext):
 async def min_size_handler(message: Message, state: FSMContext):
     if await _save_numeric(message, state, "min_size_mb", 0, 4000):
         await message.answer("✅ Minimal hajm yangilandi.", reply_markup=cfg_kb())
-
-
-@dp.message(Form.series_min)
-async def series_min_handler(message: Message, state: FSMContext):
-    if await _save_numeric(message, state, "series_min_episodes", 2, 100):
-        await message.answer("✅ Minimal qism soni yangilandi.", reply_markup=cfg_kb())
 
 
 @dp.message(Form.interval)
@@ -1417,11 +1604,12 @@ async def stats_cb(call: CallbackQuery):
             f"📤 Manzil: {_esc(stats.get('dest_title') or '—')}\n"
             f"🔎 Ko'rilgan xabar: {stats.get('scanned', 0)}\n"
             f"🎬 Topilgan video: {stats.get('found', 0)}\n"
-            f"✅ Forward: {stats.get('forwarded', 0)}\n"
-            f"📋 Nusxa: {stats.get('copied', 0)}\n"
+            f"✅ Yuborildi: {int(stats.get('forwarded', 0) or 0) + int(stats.get('copied', 0) or 0)}\n"
+            f"📋 Akkaunt nomidan: {stats.get('copied', 0)}\n"
             f"♻️ Allaqachon bor: {stats.get('skipped_existing', 0)}\n"
             f"🆕 Mavzular: {stats.get('topics_created', 0)}\n"
             f"⚠️ Xatolar: {stats.get('failed', 0)}\n"
+            f"⏹ To'xtatilgan: {'ha' if stats.get('stopped') else 'yo‘q'}\n"
             f"⏱ Davomiylik: {stats.get('elapsed', 0)} soniya"
         )
     try:
