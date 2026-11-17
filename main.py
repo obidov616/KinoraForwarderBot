@@ -407,12 +407,65 @@ async def check_topic_rights(client, entity):
     return False, "Manzil kanalda admin bo'lishingiz kerak."
 
 
+_TOPIC_ICON_EMOJI = "📁"
+_topic_icon_state = {"id": 0, "checked": 0.0}
+
+
+def topic_title_text(title: str) -> str:
+    """Mavzu nomi: «Qashqirlar Makoni p mp4 hls 2591» -> «Qashqirlar Makoni»."""
+    clean, _, _ = parse_media_title(str(title or ""))
+    clean = clean or str(title or "").strip()
+    return re.sub(r"\s+", " ", clean).strip()[:120] or "Mavzu"
+
+
 def _topic_title_key(title: str) -> str:
-    return re.sub(r"\s+", " ", str(title or "").strip().casefold())
+    """Solishtirish kaliti: emoji, fayl so'zlari va qism raqamlari e'tiborsiz."""
+    return title_key(topic_title_text(title))
+
+
+async def topic_icon_id(client):
+    """Telegramning mavzu ikonkalari to'plamidan 📁 ni topadi; topilmasa 0."""
+    if _topic_icon_state["id"]:
+        return _topic_icon_state["id"]
+    now = time.time()
+    if _topic_icon_state["checked"] and now - _topic_icon_state["checked"] < 300:
+        return 0
+    _topic_icon_state["checked"] = now
+    try:
+        res = await client(functions.messages.GetStickerSetRequest(
+            stickerset=types.InputStickerSetEmojiDefaultTopicIcons(), hash=0,
+        ))
+        for doc in (getattr(res, "documents", None) or []):
+            for attr in (getattr(doc, "attributes", None) or []):
+                if isinstance(attr, types.DocumentAttributeCustomEmoji):
+                    if (getattr(attr, "alt", "") or "").strip() == _TOPIC_ICON_EMOJI:
+                        _topic_icon_state["id"] = int(doc.id)
+                        return int(doc.id)
+        logging.info("📁 mavzu ikonkasi topilmadi — nom boshiga emoji qo'shiladi")
+    except Exception:
+        logging.warning("Mavzu ikonkalari to'plamini olib bo'lmadi", exc_info=True)
+    return 0
+
+
+def topic_display_title(title: str, icon_id: int = 0) -> str:
+    text = topic_title_text(title)
+    if not icon_id:
+        text = f"{_TOPIC_ICON_EMOJI} {text}"
+    return text[:128]
+
+
+def _plain_topic_title(title: str) -> str:
+    return re.sub(r"^[^\w]+", "", str(title or ""), flags=re.UNICODE).strip().casefold()
 
 
 async def find_topic(client, dest, title: str):
+    """(topic_id, mavjud nomi) yoki None.
+
+    Bir xil kino uchun eski nomli mavzular ko'p bo'lsa, avval toza nomli,
+    keyin eng eski mavzu tanlanadi — har safar boshqa mavzuga sakramaydi.
+    """
     needle = _topic_title_key(title)
+    plain = _plain_topic_title(topic_title_text(title))
     variants = (
         {"offset_date": None, "offset_id": 0, "offset_topic": 0, "limit": 100, "q": str(title)[:100]},
         {"offset_date": None, "offset_id": 0, "offset_topic": 0, "limit": 100, "q": None},
@@ -423,35 +476,72 @@ async def find_topic(client, dest, title: str):
         except Exception:
             logging.warning("Mavzularni qidirishda xatolik", exc_info=True)
             continue
-        for topic in (getattr(res, "topics", None) or []):
-            if isinstance(topic, types.ForumTopic) and _topic_title_key(topic.title) == needle:
-                return topic.id
+        matches = [
+            topic for topic in (getattr(res, "topics", None) or [])
+            if isinstance(topic, types.ForumTopic) and _topic_title_key(topic.title) == needle
+        ]
+        if matches:
+            matches.sort(key=lambda t: (0 if _plain_topic_title(t.title) == plain else 1, int(t.id)))
+            topic = matches[0]
+            return topic.id, str(topic.title or ""), int(getattr(topic, "icon_emoji_id", 0) or 0)
     return None
 
 
-async def create_topic(client, dest, title: str):
-    clean = re.sub(r"\s+", " ", str(title or "")).strip()[:128] or "Mavzu"
-    res = await client(functions.messages.CreateForumTopicRequest(
-        peer=dest, title=clean, random_id=random.getrandbits(63),
-    ))
-    for update in (getattr(res, "updates", None) or []):
-        message = getattr(update, "message", None)
-        if message is None:
-            continue
-        if isinstance(getattr(message, "action", None), types.MessageActionTopicCreate):
-            return message.id
-    return await find_topic(client, dest, clean)
+async def create_topic(client, dest, title: str, icon_id: int = 0):
+    for icon in ([icon_id] if icon_id else []) + [0]:
+        payload = {"peer": dest, "title": topic_display_title(title, icon),
+                   "random_id": random.getrandbits(63)}
+        if icon:
+            payload["icon_emoji_id"] = icon
+        try:
+            res = await client(functions.messages.CreateForumTopicRequest(**payload))
+        except errors.FloodWaitError:
+            raise
+        except Exception as exc:
+            if icon:
+                logging.warning("Mavzu ikonkasi bilan yaratilmadi, oddiy urinamiz: %s", exc)
+                continue
+            raise
+        for update in (getattr(res, "updates", None) or []):
+            message = getattr(update, "message", None)
+            if message is None:
+                continue
+            if isinstance(getattr(message, "action", None), types.MessageActionTopicCreate):
+                return message.id
+        found = await find_topic(client, dest, title)
+        return found[0] if found else None
+    return None
+
+
+async def edit_topic(client, dest, topic_id, title: str, icon_id: int = 0):
+    """Eski nomli mavzuni (masalan «... mp4 hls 2591») toza nomga o'zgartiradi."""
+    payload = {"peer": dest, "topic_id": topic_id,
+               "title": topic_display_title(title, icon_id)}
+    if icon_id:
+        payload["icon_emoji_id"] = icon_id
+    try:
+        await client(functions.messages.EditForumTopicRequest(**payload))
+    except Exception:
+        logging.warning("Mavzu nomini yangilab bo'lmadi (topic_id=%s)", topic_id, exc_info=True)
 
 
 async def ensure_topic(client, dest, title: str):
+    icon_id = await topic_icon_id(client)
+    display = topic_display_title(title, icon_id)
     for _attempt in range(4):
         if _stop_event.is_set():
             raise ForwardStopped()
-        topic_id = await find_topic(client, dest, title)
-        if topic_id:
+        found = await find_topic(client, dest, title)
+        if found:
+            topic_id, current, current_icon = found
+            need_edit = (current or "").strip() != display
+            if icon_id and int(current_icon or 0) != int(icon_id):
+                need_edit = True
+            if need_edit:
+                await edit_topic(client, dest, topic_id, title, icon_id)
             return topic_id, False
         try:
-            topic_id = await create_topic(client, dest, title)
+            topic_id = await create_topic(client, dest, title, icon_id)
         except errors.FloodWaitError as exc:
             logging.warning("Mavzu yaratishda limit: %s soniya", exc.seconds)
             if await _sleep_or_stop(int(exc.seconds) + 1):
@@ -459,9 +549,9 @@ async def ensure_topic(client, dest, title: str):
             continue
         if topic_id:
             return topic_id, True
-        topic_id = await find_topic(client, dest, title)
-        if topic_id:
-            return topic_id, True
+        found = await find_topic(client, dest, title)
+        if found:
+            return found[0], True
     raise RuntimeError(f"«{title}» mavzusini yaratib bo'lmadi")
 
 
@@ -501,6 +591,12 @@ _LANG_RE = re.compile(
 )
 _RES_RE = re.compile(r"(?<!\d)(?:360|480|720|1080|1440|2160)(?!\d)")
 _HD_RE = re.compile(r"\b(?:hd|fhd|uhd|sd)\b", re.I)
+_FILE_RE = re.compile(
+    r"\b(?:mp4|mkv|avi|mov|wmv|flv|webm|m4v|m2ts|mts|ts|m3u8|hls|"
+    r"h26[45]|x26[45]|hevc|avc|aac|ac3|eac3|dts|ddp|hdrip|bdrip|brrip)\b",
+    re.I,
+)
+_PART_WORD_RE = re.compile(r"\b(?:oxirgi|yakuniy|final|so['’ʻ]nggi)\s+qism\b", re.I)
 
 
 def clean_name_text(text: str) -> str:
@@ -559,11 +655,19 @@ def parse_media_title(raw: str):
     text = _QUALITY_RE.sub(" ", text)
     text = _RES_RE.sub(" ", text)
     text = _HD_RE.sub(" ", text)
+    text = _FILE_RE.sub(" ", text)
+    text = _PART_WORD_RE.sub(" ", text)
     text = _LANG_RE.sub(" ", text)
     text = re.sub(r"#\w+", " ", text)
     text = re.sub(r"(?<!\d)(?:19|20)\d{2}(?!\d)", " ", text)
     text = re.sub(r"[\[\](){}<>«»,;:•·/\\]+", " ", text)
     text = re.sub(r"\s*[-–—.]+\s*", " ", text)
+    text = re.sub(r"(?<!\w)p(?!\w)", " ", text)
+    # Qism/bo'lim hisoblagichlari: «... Makoni 2591», «Forsaj 2» -> nomdan tashlanadi.
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r"(?<=\s)\d{1,4}\s*$", "", text)
     text = clean_name_text(text)
     if text and text.isupper() and text.isascii():
         text = text.title()
@@ -610,11 +714,25 @@ def clean_caption(caption: str, fallback: str = "") -> str:
     return text[:1024]
 
 
+def looks_random_name(text: str) -> bool:
+    """«JUSTaFiLesxmtujyec» kabi avtomatik yaratilgan fayl nomlarini aniqlaydi."""
+    t = str(text or "").strip()
+    if not t or " " in t:
+        return False
+    if len(re.sub(r"[^\w]", "", t)) < 14:
+        return False
+    if len(re.findall(r"[a-z][A-Z]", t)) >= 2:
+        return True
+    return bool(re.search(r"\d", t))
+
+
 def fallback_name(caption: str, filename: str = "") -> str:
     candidates = _clean_caption_text(caption).splitlines()
     candidates.append(str(filename or ""))
     for line in candidates:
         parsed, _, _ = parse_media_title(line)
+        if looks_random_name(parsed):
+            continue
         if len(re.findall(r"[^\W\d_]", parsed, flags=re.UNICODE)) >= 2:
             return parsed[:60]
     return ""
@@ -666,6 +784,8 @@ async def scan_source(client, source, min_size: int, on_progress=None):
         _, season, episode = parse_media_title(header or first_line or document_filename(doc))
         if not name:
             name = fallback_name(caption, document_filename(doc))
+        if looks_random_name(name):
+            name = ""
         items.append({
             "msg_id": message.id,
             "grouped_id": message.grouped_id,
