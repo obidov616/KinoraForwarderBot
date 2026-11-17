@@ -1129,7 +1129,7 @@ async def run_forward(user_id, notify_chat_id=None):
         min_size = min_mb * 1024 * 1024
         movies_topic = str(settings.get("movies_topic") or "Kinolar").strip() or "Kinolar"
         clean_captions = bool(settings.get("clean_captions", True))
-        send_delay = max(0, int(settings.get("send_delay_sec", 10) or 0))
+        send_delay = max(0, min(3600, int(settings.get("send_delay_sec", 10) or 0)))
 
         items = []
         scanned_count = 0
@@ -1250,7 +1250,7 @@ async def run_forward(user_id, notify_chat_id=None):
                     has_more = bi < len(batches) - 1 or gi < len(group_list) - 1
                     if has_more and send_delay > 0:
                         await set_status(
-                            f"⏳ Spam bo'lmasligi uchun {send_delay} soniya kutilyapti…\n"
+                            f"⏳ Spam bo'lmasligi uchun {fmt_delay(send_delay)} kutilyapti…\n"
                             f"✅ Yuborildi: <b>{done}</b> ta\n"
                             f"🏷 Mavzu: {_esc(topic_title)}"
                         )
@@ -1346,6 +1346,35 @@ class Form(StatesGroup):
     delay = State()
 
 
+def fmt_delay(seconds) -> str:
+    seconds = max(0, int(seconds or 0))
+    if seconds < 60:
+        return f"{seconds} soniya"
+    if seconds >= 3600:
+        hours, rest = divmod(seconds, 3600)
+        minutes = rest // 60
+        return f"{hours} soat" + (f" {minutes} daqiqa" if minutes else "")
+    minutes, rest = divmod(seconds, 60)
+    return f"{minutes} daqiqa" + (f" {rest} s" if rest else "")
+
+
+def delay_kb(user_id):
+    settings = get_user(user_id)["settings"]
+    current = max(0, min(3600, int(settings.get("send_delay_sec", 10) or 0)))
+    presets = [0, 3, 5, 10, 30, 60]
+    rows, row = [], []
+    for value in presets:
+        label = ("✅ " if value == current else "") + ("0 s" if value == 0 else (f"{value} s" if value < 60 else "1 daq"))
+        row.append(InlineKeyboardButton(text=label, callback_data=f"delay_set:{value}"))
+        if len(row) == 3:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="✍️ Qo'lda kiritish", callback_data="delay_manual")])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="cfg")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def panel_text(user_id):
     rec = get_user(user_id)
     settings = rec["settings"]
@@ -1362,7 +1391,7 @@ def panel_text(user_id):
         f"📥 Manba: {_esc(settings.get('source_title') or settings.get('source') or 'tanlanmagan')}",
         f"📤 Manzil: {_esc(settings.get('dest_title') or settings.get('dest') or 'tanlanmagan')}",
         f"📦 Minimal hajm: {settings.get('min_size_mb', 100)} MB",
-        f"⏱ Media oralig'i: {settings.get('send_delay_sec', 10)} soniya",
+        f"⏱ Media oralig'i: {fmt_delay(settings.get('send_delay_sec', 10))}",
         f"🧽 Reklamani tozalash: {cleaning}",
         f"🔁 Avto: {auto} (har {settings.get('auto_interval_min', 30)} daqiqa)",
     ]
@@ -1424,7 +1453,7 @@ def cfg_kb(user_id):
     cleaning = "🟢 yoqilgan" if settings.get("clean_captions", True) else "🔴 o'chirilgan"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"📦 Minimal hajm: {settings.get('min_size_mb', 100)} MB", callback_data="cfg:min_size")],
-        [InlineKeyboardButton(text=f"⏱ Media oralig'i: {settings.get('send_delay_sec', 10)} s", callback_data="cfg:delay")],
+        [InlineKeyboardButton(text=f"⏱ Media oralig'i: {fmt_delay(settings.get('send_delay_sec', 10))}", callback_data="cfg:delay")],
         [InlineKeyboardButton(text=f"🎬 Bo'sh nom uchun mavzu: {settings.get('movies_topic', 'Kinolar')}", callback_data="cfg:movies_topic")],
         [InlineKeyboardButton(text=f"🧽 Reklamani tozalash: {cleaning}", callback_data="cfg:clean")],
         [InlineKeyboardButton(text=f"🔁 Avto oraliq: {settings.get('auto_interval_min', 30)} daqiqa", callback_data="cfg:interval")],
@@ -1831,9 +1860,19 @@ async def cfg_prompt(call: CallbackQuery, state: FSMContext):
         except Exception:
             await call.message.answer("⚙️ <b>Sozlamalar</b>", reply_markup=cfg_kb(uid))
         return
+    if key == "delay":
+        current = get_user(uid)["settings"].get("send_delay_sec", 10)
+        await call.message.answer(
+            f"⏱ <b>Yuborish oralig'i</b>\n\n"
+            f"Hozir: <b>{fmt_delay(current)}</b>\n\n"
+            "Har bir media (yoki albom) yuborilgandan keyin shu qadar kutib turadi — "
+            "akkaunt spam blokiga tushmasligi uchun.\n\n"
+            "Tayyor qiymatni tanlang yoki qo'lda soniya kiriting (0–3600):",
+            reply_markup=delay_kb(uid),
+        )
+        return await call.answer()
     prompts = {
         "min_size": ("min_size", Form.min_size, "📦 Minimal video hajmini MB da yuboring (masalan 100):"),
-        "delay": ("send_delay_sec", Form.delay, "⏱ Har bir media orasidagi tanaffusni soniyada yuboring (0–120, masalan 10):"),
         "movies_topic": ("movies_topic", Form.movies_topic, "🎬 Nomi aniqlanmagan fayllar uchun mavzu nomini yuboring (masalan Kinolar):"),
         "interval": ("interval", Form.interval, "🔁 Avto tekshiruv oralig'ini daqiqada yuboring (kamida 5):"),
     }
@@ -1846,6 +1885,36 @@ async def cfg_prompt(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+@dp.callback_query(F.data.startswith("delay_set:"))
+async def delay_set_cb(call: CallbackQuery, state: FSMContext):
+    uid = call.from_user.id
+    try:
+        value = int(call.data.split(":", 1)[1])
+    except ValueError:
+        return await call.answer("⚠️ Noto'g'ri qiymat", show_alert=True)
+    value = max(0, min(3600, value))
+    data = load_data()
+    rec = get_user(uid)
+    rec["settings"]["send_delay_sec"] = value
+    save_data(data)
+    await state.clear()
+    await call.answer(f"✅ Oraliq: {fmt_delay(value)}")
+    try:
+        await call.message.edit_text("⚙️ <b>Sozlamalar</b>", reply_markup=cfg_kb(uid))
+    except Exception:
+        await call.message.answer("⚙️ <b>Sozlamalar</b>", reply_markup=cfg_kb(uid))
+
+
+@dp.callback_query(F.data == "delay_manual")
+async def delay_manual_cb(call: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.delay)
+    await call.message.answer(
+        "⏱ Oraliqni soniyada yuboring (0–3600).\n"
+        "Masalan: 45 — har media orasida 45 soniya.\n\nBekor qilish: /cancel"
+    )
+    await call.answer()
+
+
 @dp.message(Form.min_size)
 async def min_size_handler(message: Message, state: FSMContext):
     if await _save_numeric(message, state, "min_size_mb", 0, 4000):
@@ -1854,7 +1923,7 @@ async def min_size_handler(message: Message, state: FSMContext):
 
 @dp.message(Form.delay)
 async def delay_handler(message: Message, state: FSMContext):
-    if await _save_numeric(message, state, "send_delay_sec", 0, 120):
+    if await _save_numeric(message, state, "send_delay_sec", 0, 3600):
         await message.answer("✅ Media oralig'i yangilandi.", reply_markup=cfg_kb(message.from_user.id))
 
 
