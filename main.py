@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -38,17 +39,14 @@ if not BOT_TOKEN:
     raise RuntimeError(
         "BOT_TOKEN topilmadi. Environment bo'limida BOT_TOKEN variable yarating."
     )
-if not OWNER_ID:
-    raise RuntimeError(
-        "OWNER_ID topilmadi. Environment bo'limida OWNER_ID ga Telegram ID (raqam) yozing."
-    )
+# OWNER_ID ixtiyoriy: faqat yangi foydalanuvchi haqida xabar olish uchun ishlatiladi.
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 
 # ================== MA'LUMOTLAR ==================
-def default_data():
+def default_user():
     return {
         "userbot": {"session": "", "phone": ""},
         "api": {"api_id": 0, "api_hash": ""},
@@ -66,7 +64,38 @@ def default_data():
         },
         "stats": {},
         "copied": {},
+        "created_at": 0,
+        "last_seen": 0,
     }
+
+
+def default_data():
+    return {"users": {}}
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _norm_user(rec) -> dict:
+    """Yozuvni to'liq shaklga keltiradi (eski/yetishmagan maydonlar to'ldiriladi)."""
+    base = default_user()
+    if not isinstance(rec, dict):
+        return base
+    for key in ("userbot", "api", "settings"):
+        current = rec.get(key)
+        if isinstance(current, dict):
+            base[key].update(current)
+    for key in ("stats", "copied"):
+        current = rec.get(key)
+        if isinstance(current, dict):
+            base[key] = current
+    base["created_at"] = _safe_int(rec.get("created_at"), 0)
+    base["last_seen"] = _safe_int(rec.get("last_seen"), 0)
+    return base
 
 
 _DATA_CACHE = None
@@ -84,23 +113,44 @@ def load_data():
     if not DATA_FILE.exists():
         save_data(default_data())
     try:
-        data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        data = default_data()
-    base = default_data()
-    for key, value in base.items():
-        data.setdefault(key, value)
-    for key, value in base["settings"].items():
-        data["settings"].setdefault(key, value)
-    data.setdefault("api", {})
-    data.setdefault("userbot", {})
-    data.setdefault("stats", {})
-    data.setdefault("copied", {})
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    users = raw.get("users")
+    if not isinstance(users, dict):
+        users = {}
+    changed = False
+    legacy_keys = ("userbot", "api", "settings", "stats", "copied")
+    if any(key in raw for key in legacy_keys):
+        # Eski bir foydalanuvchili format: hammasi OWNER_ID hisobiga ko'chadi.
+        legacy_key = str(OWNER_ID or 0)
+        target = users.get(legacy_key)
+        if not isinstance(target, dict):
+            target = {}
+        for key in legacy_keys:
+            if key in raw and key not in target:
+                target[key] = raw[key]
+        users[legacy_key] = target
+        changed = True
+
+    data = {"users": {}}
+    for key, rec in users.items():
+        text = str(key).strip()
+        if not text.lstrip("-").isdigit():
+            changed = True
+            continue
+        data["users"][str(int(text))] = _norm_user(rec)
+
     _DATA_CACHE = data
     try:
         _DATA_CACHE_MTIME = DATA_FILE.stat().st_mtime_ns
     except OSError:
         _DATA_CACHE_MTIME = None
+    if changed:
+        save_data(data)
     return data
 
 
@@ -114,10 +164,39 @@ def save_data(data):
         _DATA_CACHE_MTIME = DATA_FILE.stat().st_mtime_ns
     except OSError:
         _DATA_CACHE_MTIME = None
+    return data
 
 
 def now_ts() -> int:
     return int(time.time())
+
+
+def user_key(user_id) -> str:
+    return str(_safe_int(user_id, 0))
+
+
+def get_user(user_id, create: bool = True) -> dict:
+    """Foydalanuvchi yozuvi (cache ichida). O'zgartirgach save_data() chaqiring."""
+    data = load_data()
+    users = data.setdefault("users", {})
+    key = user_key(user_id)
+    rec = users.get(key)
+    if not isinstance(rec, dict):
+        rec = _norm_user({})
+        if not create:
+            return rec
+        rec["created_at"] = now_ts()
+        users[key] = rec
+        save_data(data)
+    return rec
+
+
+def all_users() -> dict:
+    return load_data().get("users", {})
+
+
+def user_settings(user_id) -> dict:
+    return get_user(user_id)["settings"]
 
 
 def fmt_date(timestamp) -> str:
@@ -140,12 +219,11 @@ def fmt_size(num_bytes: int) -> str:
 
 
 def is_owner(user_id) -> bool:
-    return bool(OWNER_ID) and int(user_id or 0) == OWNER_ID
+    return bool(OWNER_ID) and _safe_int(user_id, 0) == OWNER_ID
 
 
-def get_api():
-    data = load_data()
-    api = data.get("api", {}) or {}
+def get_api(user_id):
+    api = get_user(user_id).get("api") or {}
     api_id = api.get("api_id") or os.getenv("API_ID", "")
     api_hash = api.get("api_hash") or os.getenv("API_HASH", "")
     try:
@@ -155,35 +233,55 @@ def get_api():
     return api_id, str(api_hash or "").strip()
 
 
-def get_session() -> str:
-    data = load_data()
-    return str((data.get("userbot", {}) or {}).get("session") or os.getenv("USERBOT_SESSION", "")).strip()
+def get_session(user_id) -> str:
+    userbot = get_user(user_id, create=False).get("userbot") or {}
+    return str(userbot.get("session") or "").strip()
 
 
-# ================== USERBOT (AKKAUNT) ==================
-_client = None
-_login_client = None
-_run_lock = asyncio.Lock()
-_client_lock = asyncio.Lock()
+# ================== USERBOT (HAR BIR FOYDALANUVCHI UCHUN) ==================
+_clients = {}
+_login_clients = {}
+_client_locks = {}
+_run_locks = {}
+_stop_events = {}
 _background_tasks = set()
-_stop_event = asyncio.Event()
+# Har bir forward o'z taskida ishlaydi; stop signali shu context orqali uzatiladi.
+_stop_ctx = contextvars.ContextVar("forward_stop", default=None)
 
 
 class ForwardStopped(Exception):
     pass
 
 
-def request_stop() -> bool:
-    """Forward ketayotgan bo'lsa to'xtatishni so'raydi."""
-    running = _run_lock.locked()
-    _stop_event.set()
+def run_lock(user_id) -> asyncio.Lock:
+    return _run_locks.setdefault(user_key(user_id), asyncio.Lock())
+
+
+def stop_event(user_id) -> asyncio.Event:
+    return _stop_events.setdefault(user_key(user_id), asyncio.Event())
+
+
+def is_stopped() -> bool:
+    event = _stop_ctx.get()
+    return bool(event is not None and event.is_set())
+
+
+def request_stop(user_id) -> bool:
+    """Foydalanuvchining forwardi ketayotgan bo'lsa to'xtatishni so'raydi."""
+    running = run_lock(user_id).locked()
+    stop_event(user_id).set()
     return running
 
 
 async def _sleep_or_stop(seconds: float) -> bool:
     """Kutish davomida stop so'ralsa True qaytaradi."""
+    delay = max(0.1, float(seconds))
+    event = _stop_ctx.get()
+    if event is None:
+        await asyncio.sleep(delay)
+        return False
     try:
-        await asyncio.wait_for(_stop_event.wait(), timeout=max(0.1, float(seconds)))
+        await asyncio.wait_for(event.wait(), timeout=delay)
         return True
     except asyncio.TimeoutError:
         return False
@@ -196,130 +294,159 @@ def spawn(coro):
     return task
 
 
-async def close_client():
-    global _client
-    if _client is not None:
+async def close_client(user_id):
+    client = _clients.pop(user_key(user_id), None)
+    if client is not None:
         try:
-            await _client.disconnect()
+            await client.disconnect()
         except Exception:
             pass
-        _client = None
 
 
-async def userbot_client():
-    """Saqlangan session orqali akkauntga ulanadi; bo'lmasa None qaytaradi."""
-    global _client
-    if _client is not None and _client.is_connected():
-        try:
-            if await _client.is_user_authorized():
-                return _client
-        except Exception:
-            pass
-    async with _client_lock:
-        if _client is not None and _client.is_connected():
+async def close_all_clients():
+    for key in list(_clients.keys()):
+        client = _clients.pop(key, None)
+        if client is not None:
             try:
-                if await _client.is_user_authorized():
-                    return _client
+                await client.disconnect()
             except Exception:
                 pass
-        session = get_session()
-        api_id, api_hash = get_api()
+
+
+async def userbot_client(user_id):
+    """Foydalanuvchining saqlangan sessioni orqali ulanadi; bo'lmasa None."""
+    key = user_key(user_id)
+    client = _clients.get(key)
+    if client is not None and client.is_connected():
+        try:
+            if await client.is_user_authorized():
+                return client
+        except Exception:
+            pass
+    lock = _client_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        client = _clients.get(key)
+        if client is not None and client.is_connected():
+            try:
+                if await client.is_user_authorized():
+                    return client
+            except Exception:
+                pass
+        session = get_session(user_id)
+        api_id, api_hash = get_api(user_id)
         if not session or not api_id or not api_hash:
             return None
-        await close_client()
-        _client = TelegramClient(
+        await close_client(user_id)
+        client = TelegramClient(
             StringSession(session), api_id, api_hash,
             connection_retries=5, retry_delay=2, auto_reconnect=True,
         )
         try:
-            await _client.connect()
-            if not await _client.is_user_authorized():
-                await close_client()
+            await client.connect()
+            if not await client.is_user_authorized():
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
                 return None
         except Exception:
-            logging.exception("Userbotga ulanishda xatolik")
-            await close_client()
+            logging.exception("Userbotga ulanishda xatolik (uid=%s)", key)
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
             return None
-        return _client
+        _clients[key] = client
+        return client
 
 
-async def login_abort():
-    global _login_client
-    if _login_client is not None:
+async def login_abort(user_id):
+    client = _login_clients.pop(user_key(user_id), None)
+    if client is not None:
         try:
-            await _login_client.disconnect()
+            await client.disconnect()
         except Exception:
             pass
-        _login_client = None
 
 
-async def login_start(phone: str):
+async def login_start(user_id, phone: str):
     """Kod so'rovini yuboradi va phone_code_hash qaytaradi."""
-    global _login_client
-    api_id, api_hash = get_api()
+    api_id, api_hash = get_api(user_id)
     if not api_id or not api_hash:
         raise RuntimeError("API_ID va API_HASH kiritilmagan.")
-    await login_abort()
-    _login_client = TelegramClient(StringSession(), api_id, api_hash)
+    await login_abort(user_id)
+    client = TelegramClient(StringSession(), api_id, api_hash)
+    _login_clients[user_key(user_id)] = client
     try:
-        await _login_client.connect()
-        sent = await _login_client.send_code_request(phone)
+        await client.connect()
+        sent = await client.send_code_request(phone)
     except Exception:
-        await login_abort()
+        await login_abort(user_id)
         raise
     return sent.phone_code_hash
 
 
-async def login_code(phone: str, code: str, phone_code_hash: str):
+async def login_code(user_id, phone: str, code: str, phone_code_hash: str):
     """Kodni tasdiqlaydi. 'ok' yoki 'password' qaytaradi."""
-    if _login_client is None:
+    client = _login_clients.get(user_key(user_id))
+    if client is None:
         raise RuntimeError("Kirish sessiyasi yo'qoldi. «🔐 Kirish» ni qaytadan bosing.")
     try:
-        await _login_client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+        await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
     except errors.SessionPasswordNeededError:
         return "password"
     return "ok"
 
 
-async def login_password(password: str):
-    if _login_client is None:
+async def login_password(user_id, password: str):
+    client = _login_clients.get(user_key(user_id))
+    if client is None:
         raise RuntimeError("Kirish sessiyasi yo'qoldi. «🔐 Kirish» ni qaytadan bosing.")
-    await _login_client.sign_in(password=password)
+    await client.sign_in(password=password)
     return "ok"
 
 
-async def login_finish(phone: str):
-    """Muvaffaqiyatli kirishdan keyin sessionni saqlaydi."""
-    global _client, _login_client
-    if _login_client is None:
+async def login_finish(user_id, phone: str):
+    """Muvaffaqiyatli kirishdan keyin sessionni foydalanuvchi yozuviga saqlaydi."""
+    key = user_key(user_id)
+    client = _login_clients.pop(key, None)
+    if client is None:
         raise RuntimeError("Kirish sessiyasi yo'qoldi. «🔐 Kirish» ni qaytadan bosing.")
-    await _login_client.connect()
-    me = await _login_client.get_me()
-    session_string = _login_client.session.save()
+    await client.connect()
+    me = await client.get_me()
+    session_string = client.session.save()
     data = load_data()
-    data["userbot"] = {"session": session_string, "phone": phone}
+    rec = get_user(user_id)
+    rec["userbot"] = {"session": session_string, "phone": phone}
     save_data(data)
-    _client = _login_client
-    _login_client = None
+    old = _clients.pop(key, None)
+    if old is not None and old is not client:
+        try:
+            await old.disconnect()
+        except Exception:
+            pass
+    _clients[key] = client
     return me
 
 
-async def logout_userbot():
-    global _client
-    if _client is None:
-        await userbot_client()
-    if _client is not None:
+async def logout_userbot(user_id):
+    key = user_key(user_id)
+    client = _clients.get(key)
+    if client is None:
+        client = await userbot_client(user_id)
+    if client is not None:
         try:
-            await _client.log_out()
+            await client.log_out()
         except Exception:
             logging.exception("Logout xatosi")
         try:
-            await _client.disconnect()
+            await client.disconnect()
         except Exception:
             pass
-    _client = None
+    _clients.pop(key, None)
     data = load_data()
-    data["userbot"] = {"session": "", "phone": ""}
+    rec = get_user(user_id)
+    rec["userbot"] = {"session": "", "phone": ""}
     save_data(data)
 
 
@@ -530,7 +657,7 @@ async def ensure_topic(client, dest, title: str):
     icon_id = await topic_icon_id(client)
     display = topic_display_title(title, icon_id)
     for _attempt in range(4):
-        if _stop_event.is_set():
+        if is_stopped():
             raise ForwardStopped()
         found = await find_topic(client, dest, title)
         if found:
@@ -559,6 +686,12 @@ async def ensure_topic(client, dest, title: str):
 # ================== NOMLARNI ANIQLASH ==================
 _URL_RE = re.compile(r"(?:https?://\S+|t\.me/\S+|@[A-Za-z0-9_]{4,})", re.I)
 _EXT_RE = re.compile(r"\.(?:mp4|mkv|avi|mov|wmv|flv|webm|m4v|ts|m2ts|rar|zip)\b", re.I)
+# «Video: 1080p | Audio: uzb 👁 | Subtitr: ×» kabi maydonlar nomga qo'shilmaydi.
+_FIELD_RE = re.compile(
+    r"\b(?:video|audio|subtitr(?:i)?|sifat(?:i)?|tili?|janr(?:i)?|yil(?:i)?|"
+    r"davlat(?:i)?|davomiylik|format|kodek)\s*[:：]\s*[^/\n|]*",
+    re.I,
+)
 _SE_RE = re.compile(r"\bS(\d{1,2})\s*[._-]?\s*E(\d{1,3})\b", re.I)
 _EP_MARKER_RE = re.compile(
     r"(?<!\d)(\d{1,4})\s*[-–—_.]?\s*"
@@ -615,6 +748,7 @@ def parse_media_title(raw: str):
     text = unicodedata.normalize("NFKC", str(raw or ""))
     text = _URL_RE.sub(" ", text)
     text = _EXT_RE.sub(" ", text)
+    text = _FIELD_RE.sub(" ", text)
     text = _LABEL_RE.sub(" ", text)
     text = text.replace("_", " ").replace("|", " ")
 
@@ -782,7 +916,7 @@ async def fetch_source_topics(client, peer):
     offset_topic = offset_id = 0
     offset_date = None
     for _page in range(30):
-        if _stop_event.is_set():
+        if is_stopped():
             raise ForwardStopped()
         res = await client(functions.messages.GetForumTopicsRequest(
             peer=peer, offset_date=offset_date, offset_id=offset_id,
@@ -813,7 +947,7 @@ async def scan_source(client, source, min_size: int, on_progress=None, topic_tit
     scanned = 0
     async for message in client.iter_messages(source, reverse=True, wait_time=0.4):
         scanned += 1
-        if _stop_event.is_set():
+        if is_stopped():
             raise ForwardStopped()
         doc = video_document(message)
         if doc is None or int(doc.size or 0) <= min_size:
@@ -856,7 +990,7 @@ async def scan_source(client, source, min_size: int, on_progress=None, topic_tit
 async def existing_doc_ids(client, dest):
     ids = set()
     async for message in client.iter_messages(dest, wait_time=0.4):
-        if _stop_event.is_set():
+        if is_stopped():
             raise ForwardStopped()
         doc = getattr(message, "document", None)
         if doc is not None:
@@ -923,16 +1057,17 @@ async def send_batch(client, source, dest, topic_id, batch, clean: bool):
     return ""
 
 
-def remember_copies(records):
+def remember_copies(user_id, records):
     """Nusxa (copy) yuborilganda fayl ID o'zgaradi — takrorlmasligi uchun manba ID sini saqlaymiz."""
     data = load_data()
-    copied = data.setdefault("copied", {})
+    rec = get_user(user_id)
+    copied = rec.setdefault("copied", {})
     stamp = now_ts()
     for record in records:
         copied[str(record["doc_id"])] = stamp
     if len(copied) > 50000:
         newest = sorted(copied.items(), key=lambda kv: kv[1], reverse=True)[:40000]
-        data["copied"] = dict(newest)
+        rec["copied"] = dict(newest)
     save_data(data)
 
 
@@ -946,20 +1081,24 @@ async def _notify(chat_id, text):
         logging.exception("Xabar yuborilmadi")
 
 
-async def run_forward(notify_chat_id=None):
-    if _run_lock.locked():
+async def run_forward(user_id, notify_chat_id=None):
+    lock = run_lock(user_id)
+    if lock.locked():
         await _notify(notify_chat_id, "⏳ Forward allaqachon ketmoqda. Tugashini kuting.")
         return None
-    async with _run_lock:
-        _stop_event.clear()
-        settings = load_data().get("settings", {})
+    async with lock:
+        event = stop_event(user_id)
+        event.clear()
+        # Stop signali context orqali chuqur yordamchi funksiyalarga uzatiladi.
+        _stop_ctx.set(event)
+        settings = user_settings(user_id)
         source_ref = str(settings.get("source") or "").strip()
         dest_ref = str(settings.get("dest") or "").strip()
         if not source_ref or not dest_ref:
             await _notify(notify_chat_id, "❌ Avval manba va manzil kanallarni tanlang.")
             return None
 
-        client = await userbot_client()
+        client = await userbot_client(user_id)
         if client is None:
             await _notify(notify_chat_id, "❌ Akkaunt ulanmagan. «🔐 Akkauntga kirish» bo'limidan kiring.")
             return None
@@ -1008,7 +1147,7 @@ async def run_forward(notify_chat_id=None):
             except Exception as exc:
                 await set_status(f"❌ Manzil kanalni o'qib bo'lmadi: <code>{_esc(str(exc))}</code>")
                 return None
-            for doc_id in (load_data().get("copied", {}) or {}):
+            for doc_id in (get_user(user_id).get("copied") or {}):
                 try:
                     existing.add(int(doc_id))
                 except (TypeError, ValueError):
@@ -1068,7 +1207,7 @@ async def run_forward(notify_chat_id=None):
 
             group_list = list(groups.items())
             for gi, (key, records) in enumerate(group_list):
-                if _stop_event.is_set():
+                if is_stopped():
                     stopped = True
                     break
                 topic_title = group_titles[key].most_common(1)[0][0] or movies_topic
@@ -1085,7 +1224,7 @@ async def run_forward(notify_chat_id=None):
 
                 batches = chunk_albums(records)
                 for bi, batch in enumerate(batches):
-                    if _stop_event.is_set():
+                    if is_stopped():
                         stopped = True
                         break
                     result = await send_batch(client, source, dest, topic_id, batch, clean_captions)
@@ -1095,7 +1234,7 @@ async def run_forward(notify_chat_id=None):
                     if result == "copy":
                         copied += len(batch)
                         existing.update(record["doc_id"] for record in batch)
-                        remember_copies(batch)
+                        remember_copies(user_id, batch)
                     elif result == "forward":
                         forwarded += len(batch)
                         existing.update(record["doc_id"] for record in batch)
@@ -1140,7 +1279,8 @@ async def run_forward(notify_chat_id=None):
             "dest_title": channel_title(dest),
         }
         data = load_data()
-        data["stats"] = stats
+        rec = get_user(user_id)
+        rec["stats"] = stats
         save_data(data)
 
         summary = (
@@ -1158,7 +1298,7 @@ async def run_forward(notify_chat_id=None):
         if notify_chat_id:
             await set_status(summary)
         elif total_sent or failed or stopped:
-            await _notify(OWNER_ID, "🔄 <b>Avto-forward</b>\n" + summary)
+            await _notify(user_id, "🔄 <b>Avto-forward</b>\n" + summary)
         return stats
 
 
@@ -1166,12 +1306,27 @@ async def auto_loop():
     await asyncio.sleep(10)
     while True:
         try:
-            settings = load_data().get("settings", {})
-            if settings.get("auto") and get_session():
+            # Har bir foydalanuvchi jadvali alohida tekshiriladi; ketma-ket ishlaydi.
+            for key, rec in list(all_users().items()):
+                try:
+                    uid = int(key)
+                except (TypeError, ValueError):
+                    continue
+                settings = rec.get("settings") or {}
+                if not settings.get("auto"):
+                    continue
+                if not (rec.get("userbot") or {}).get("session"):
+                    continue
                 interval = max(5, int(settings.get("auto_interval_min", 30) or 30)) * 60
-                last_run = int(load_data().get("stats", {}).get("last_run", 0) or 0)
-                if now_ts() - last_run >= interval:
-                    await run_forward(notify_chat_id=None)
+                last_run = int((rec.get("stats") or {}).get("last_run", 0) or 0)
+                if now_ts() - last_run < interval:
+                    continue
+                if run_lock(uid).locked():
+                    continue
+                try:
+                    await run_forward(uid, notify_chat_id=None)
+                except Exception:
+                    logging.exception("Avto-forward xatosi (uid=%s)", uid)
         except Exception:
             logging.exception("Avto-forward xatosi")
         await asyncio.sleep(30)
@@ -1191,12 +1346,12 @@ class Form(StatesGroup):
     delay = State()
 
 
-def panel_text():
-    data = load_data()
-    settings = data["settings"]
-    stats = data.get("stats", {})
-    api_id, api_hash = get_api()
-    linked = "✅ ulangan" if get_session() else "❌ ulanmagan"
+def panel_text(user_id):
+    rec = get_user(user_id)
+    settings = rec["settings"]
+    stats = rec.get("stats", {})
+    api_id, api_hash = get_api(user_id)
+    linked = "✅ ulangan" if get_session(user_id) else "❌ ulanmagan"
     auto = "🟢 yoqilgan" if settings.get("auto") else "🔴 o'chirilgan"
     cleaning = "🟢 yoqilgan" if settings.get("clean_captions", True) else "🔴 o'chirilgan"
     lines = [
@@ -1228,9 +1383,9 @@ def panel_text():
     return "\n".join(lines)
 
 
-def panel_kb():
-    settings = load_data()["settings"]
-    linked = bool(get_session())
+def panel_kb(user_id):
+    settings = get_user(user_id)["settings"]
+    linked = bool(get_session(user_id))
     auto = bool(settings.get("auto"))
     rows = [
         [InlineKeyboardButton(
@@ -1264,8 +1419,8 @@ def account_kb(linked: bool):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def cfg_kb():
-    settings = load_data()["settings"]
+def cfg_kb(user_id):
+    settings = get_user(user_id)["settings"]
     cleaning = "🟢 yoqilgan" if settings.get("clean_captions", True) else "🔴 o'chirilgan"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"📦 Minimal hajm: {settings.get('min_size_mb', 100)} MB", callback_data="cfg:min_size")],
@@ -1278,9 +1433,9 @@ def cfg_kb():
     ])
 
 
-async def show_panel(target, edit=False):
-    text = panel_text()
-    markup = panel_kb()
+async def show_panel(target, user_id, edit=False):
+    text = panel_text(user_id)
+    markup = panel_kb(user_id)
     if edit:
         try:
             await target.edit_text(text, reply_markup=markup)
@@ -1294,48 +1449,63 @@ async def show_panel(target, edit=False):
 @dp.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
     await state.clear()
-    if not is_owner(message.from_user.id):
-        return await message.answer(
-            f"🔒 Bu bot shaxsiy.\nSizning ID: <code>{message.from_user.id}</code>"
+    uid = message.from_user.id
+    data = load_data()
+    users = data.setdefault("users", {})
+    is_new = user_key(uid) not in users
+    rec = get_user(uid)
+    rec["last_seen"] = now_ts()
+    if is_new:
+        rec["created_at"] = now_ts()
+    save_data(data)
+    if is_new and OWNER_ID and not is_owner(uid):
+        who = message.from_user.full_name or "—"
+        uname = f"@{message.from_user.username}" if message.from_user.username else "—"
+        await _notify(
+            OWNER_ID,
+            "🆕 <b>Yangi foydalanuvchi</b>\n"
+            f"🆔 <code>{uid}</code>\n"
+            f"👤 {_esc(who)}\n"
+            f"🔗 {_esc(uname)}",
         )
-    await message.answer(panel_text(), reply_markup=panel_kb())
+    await message.answer(
+        "👋 Salom! Manba kanaldagi kinolarni manzil kanalga mavzular bo'yicha "
+        "avtomatik ko'chiruvchi bot.\n\n" + panel_text(uid),
+        reply_markup=panel_kb(uid),
+    )
 
 
 @dp.message(Command("panel"))
 async def panel_command(message: Message, state: FSMContext):
     await state.clear()
-    if not is_owner(message.from_user.id):
-        return
-    await message.answer(panel_text(), reply_markup=panel_kb())
+    uid = message.from_user.id
+    get_user(uid)["last_seen"] = now_ts()
+    await message.answer(panel_text(uid), reply_markup=panel_kb(uid))
 
 
 @dp.message(Command("cancel"))
 async def cancel_handler(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        return
+    uid = message.from_user.id
     await state.clear()
-    await login_abort()
-    await message.answer("✅ Bekor qilindi.", reply_markup=panel_kb())
+    await login_abort(uid)
+    await message.answer("✅ Bekor qilindi.", reply_markup=panel_kb(uid))
 
 
 @dp.message(Command("stop"))
 async def stop_command(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        return
-    if request_stop():
+    uid = message.from_user.id
+    if request_stop(uid):
         await message.answer(
             "⏹ To'xtatilmoqda… Joriy fayl yuborilgach to'xtaydi.",
-            reply_markup=panel_kb(),
+            reply_markup=panel_kb(uid),
         )
     else:
-        await message.answer("Hozir forward ketmayapti.", reply_markup=panel_kb())
+        await message.answer("Hozir forward ketmayapti.", reply_markup=panel_kb(uid))
 
 
 @dp.callback_query(F.data == "stop_run")
 async def stop_run_cb(call: CallbackQuery):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Shaxsiy bot", show_alert=True)
-    if request_stop():
+    if request_stop(call.from_user.id):
         await call.answer("⏹ To'xtatilmoqda…", show_alert=True)
     else:
         await call.answer("Hozir forward ketmayapti", show_alert=True)
@@ -1343,21 +1513,18 @@ async def stop_run_cb(call: CallbackQuery):
 
 @dp.callback_query(F.data == "panel")
 async def panel_cb(call: CallbackQuery, state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Shaxsiy bot", show_alert=True)
     await state.clear()
-    await show_panel(call.message, edit=True)
+    await show_panel(call.message, call.from_user.id, edit=True)
     await call.answer()
 
 
 @dp.callback_query(F.data == "account")
 async def account_cb(call: CallbackQuery, state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Shaxsiy bot", show_alert=True)
     await state.clear()
-    data = load_data()
-    phone = (data.get("userbot", {}) or {}).get("phone") or "—"
-    linked = bool(get_session())
+    uid = call.from_user.id
+    rec = get_user(uid)
+    phone = (rec.get("userbot") or {}).get("phone") or "—"
+    linked = bool(get_session(uid))
     text = (
         "👤 <b>Telegram akkaunt</b>\n\n"
         f"Holat: {'✅ ulangan' if linked else '❌ ulanmagan'}\n"
@@ -1373,9 +1540,7 @@ async def account_cb(call: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "login")
 async def login_cb(call: CallbackQuery, state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Shaxsiy bot", show_alert=True)
-    api_id, api_hash = get_api()
+    api_id, api_hash = get_api(call.from_user.id)
     if not api_id or not api_hash:
         return await call.answer("❌ Avval API_ID va API_HASH kiriting", show_alert=True)
     await state.set_state(Form.phone)
@@ -1388,9 +1553,7 @@ async def login_cb(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.phone)
 async def phone_handler(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await state.clear()
-        return
+    uid = message.from_user.id
     phone = re.sub(r"\D", "", message.text or "")
     if phone.startswith("00"):
         phone = phone[2:]
@@ -1398,12 +1561,12 @@ async def phone_handler(message: Message, state: FSMContext):
         return await message.answer("⚠️ Raqam noto'g'ri. Masalan: <code>+998901234567</code>")
     phone = "+" + phone
     try:
-        code_hash = await login_start(phone)
+        code_hash = await login_start(uid, phone)
     except errors.FloodWaitError as exc:
         return await message.answer(f"⏳ Telegram limit: {exc.seconds} soniyadan keyin urinib ko'ring.")
     except errors.ApiIdInvalidError:
         await state.clear()
-        return await message.answer("❌ API_ID yoki API_HASH noto'g'ri.", reply_markup=panel_kb())
+        return await message.answer("❌ API_ID yoki API_HASH noto'g'ri.", reply_markup=panel_kb(uid))
     except Exception as exc:
         logging.exception("Kod yuborishda xatolik")
         return await message.answer(f"❌ Kod yuborilmadi: <code>{_esc(str(exc))}</code>")
@@ -1421,9 +1584,7 @@ async def phone_handler(message: Message, state: FSMContext):
 
 @dp.message(Form.code)
 async def code_handler(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await state.clear()
-        return
+    uid = message.from_user.id
     code = re.sub(r"\D", "", message.text or "")
     ctx = await state.get_data()
     phone = ctx.get("phone")
@@ -1432,18 +1593,18 @@ async def code_handler(message: Message, state: FSMContext):
         return await message.answer("⚠️ Kod faqat raqamlardan iborat. Qayta yuboring:")
     if not phone or not code_hash:
         await state.clear()
-        await login_abort()
+        await login_abort(uid)
         return await message.answer(
             "❌ Kirish sessiyasi topilmadi. «🔐 Akkauntga kirish» ni qaytadan bosing.",
-            reply_markup=panel_kb(),
+            reply_markup=panel_kb(uid),
         )
     try:
-        result = await login_code(phone, code, code_hash)
+        result = await login_code(uid, phone, code, code_hash)
     except errors.PhoneCodeInvalidError:
         return await message.answer("❌ Kod xato. Qayta kiriting:")
     except errors.PhoneCodeExpiredError:
         await state.clear()
-        await login_abort()
+        await login_abort(uid)
         return await message.answer("❌ Kod muddati tugagan. Qaytadan «🔐 Kirish» ni bosing.")
     except errors.FloodWaitError as exc:
         return await message.answer(f"⏳ Telegram limit: {exc.seconds} soniya kuting.")
@@ -1463,34 +1624,32 @@ async def code_handler(message: Message, state: FSMContext):
         )
 
     try:
-        me = await login_finish(phone)
+        me = await login_finish(uid, phone)
     except Exception as exc:
         logging.exception("Kirishni yakunlashda xatolik")
         await state.clear()
         return await message.answer(
             f"❌ Kirishni yakunlab bo'lmadi: <code>{_esc(str(exc))}</code>",
-            reply_markup=panel_kb(),
+            reply_markup=panel_kb(uid),
         )
     await state.clear()
     name = getattr(me, "username", None) or getattr(me, "first_name", "") or "akkaunt"
     await message.answer(
         f"✅ Akkaunt ulandi: <b>{_esc(str(name))}</b>",
-        reply_markup=panel_kb(),
+        reply_markup=panel_kb(uid),
     )
 
 
 @dp.message(Form.password)
 async def password_handler(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await state.clear()
-        return
+    uid = message.from_user.id
     password = message.text or ""
     if not password:
         return await message.answer("⚠️ Parolni yuboring. Bekor qilish: /cancel")
     ctx = await state.get_data()
     phone = ctx.get("phone", "")
     try:
-        await login_password(password)
+        await login_password(uid, password)
     except errors.PasswordHashInvalidError:
         return await message.answer("❌ Parol xato. Qayta kiriting:")
     except errors.FloodWaitError as exc:
@@ -1505,36 +1664,33 @@ async def password_handler(message: Message, state: FSMContext):
         pass
 
     try:
-        me = await login_finish(phone)
+        me = await login_finish(uid, phone)
     except Exception as exc:
         logging.exception("Kirishni yakunlashda xatolik")
         await state.clear()
         return await message.answer(
             f"❌ Kirishni yakunlab bo'lmadi: <code>{_esc(str(exc))}</code>",
-            reply_markup=panel_kb(),
+            reply_markup=panel_kb(uid),
         )
     await state.clear()
     name = getattr(me, "username", None) or getattr(me, "first_name", "") or "akkaunt"
     await message.answer(
         f"✅ Akkaunt ulandi: <b>{_esc(str(name))}</b>\nEndi kanallarni tanlang.",
-        reply_markup=panel_kb(),
+        reply_markup=panel_kb(uid),
     )
 
 
 @dp.callback_query(F.data == "logout")
 async def logout_cb(call: CallbackQuery):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Shaxsiy bot", show_alert=True)
-    await logout_userbot()
+    uid = call.from_user.id
+    await logout_userbot(uid)
     await call.answer("✅ Akkauntdan chiqildi")
-    await show_panel(call.message, edit=True)
+    await show_panel(call.message, uid, edit=True)
 
 
 @dp.callback_query(F.data == "set_api")
 async def set_api_cb(call: CallbackQuery, state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Shaxsiy bot", show_alert=True)
-    api_id, api_hash = get_api()
+    api_id, api_hash = get_api(call.from_user.id)
     await state.set_state(Form.api)
     await call.message.answer(
         "🔑 <b>API_ID va API_HASH</b>\n"
@@ -1549,9 +1705,7 @@ async def set_api_cb(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.api)
 async def api_handler(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await state.clear()
-        return
+    uid = message.from_user.id
     raw = (message.text or "").replace("\n", " ").strip()
     match = re.fullmatch(r"(\d{3,12})\s*[:;,\s]\s*([0-9a-fA-F]{20,40})", raw)
     if not match:
@@ -1560,21 +1714,20 @@ async def api_handler(message: Message, state: FSMContext):
             "<code>1234567:0123456789abcdef0123456789abcdef</code>"
         )
     data = load_data()
-    data["api"] = {"api_id": int(match.group(1)), "api_hash": match.group(2).lower()}
+    rec = get_user(uid)
+    rec["api"] = {"api_id": int(match.group(1)), "api_hash": match.group(2).lower()}
     save_data(data)
-    await close_client()
+    await close_client(uid)
     await state.clear()
     try:
         await message.delete()
     except Exception:
         pass
-    await message.answer("✅ API ma'lumotlari saqlandi.", reply_markup=panel_kb())
+    await message.answer("✅ API ma'lumotlari saqlandi.", reply_markup=panel_kb(uid))
 
 
 @dp.callback_query(F.data == "set_source")
 async def set_source_cb(call: CallbackQuery, state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Shaxsiy bot", show_alert=True)
     await state.set_state(Form.source)
     await call.message.answer(
         "📥 <b>Manba kanal</b>\n@username, -100... ID yoki https://t.me/kanal yuboring.\n"
@@ -1585,14 +1738,12 @@ async def set_source_cb(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.source)
 async def source_handler(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await state.clear()
-        return
+    uid = message.from_user.id
     raw = (message.text or "").strip()
     parsed = parse_chat_ref(raw)
     if parsed == "":
         return await message.answer("⚠️ @username yoki -100... ID yuboring (taklif havolasi emas).")
-    client = await userbot_client()
+    client = await userbot_client(uid)
     if client is None:
         return await message.answer("❌ Avval akkauntga kiring.")
     try:
@@ -1602,20 +1753,19 @@ async def source_handler(message: Message, state: FSMContext):
     username = getattr(entity, "username", None)
     stored = "@" + username if username else str(entity.id)
     data = load_data()
-    data["settings"]["source"] = stored
-    data["settings"]["source_title"] = channel_title(entity)
+    rec = get_user(uid)
+    rec["settings"]["source"] = stored
+    rec["settings"]["source_title"] = channel_title(entity)
     save_data(data)
     await state.clear()
     await message.answer(
         f"✅ Manba saqlandi: <b>{_esc(channel_title(entity))}</b>\n<code>{_esc(stored)}</code>",
-        reply_markup=panel_kb(),
+        reply_markup=panel_kb(uid),
     )
 
 
 @dp.callback_query(F.data == "set_dest")
 async def set_dest_cb(call: CallbackQuery, state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Shaxsiy bot", show_alert=True)
     await state.set_state(Form.dest)
     await call.message.answer(
         "📤 <b>Manzil kanal</b>\nMavzular (Topics) yoqilgan kanal bo'lishi kerak.\n"
@@ -1626,13 +1776,11 @@ async def set_dest_cb(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.dest)
 async def dest_handler(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await state.clear()
-        return
+    uid = message.from_user.id
     raw = (message.text or "").strip()
     if parse_chat_ref(raw) == "":
         return await message.answer("⚠️ @username yoki -100... ID yuboring.")
-    client = await userbot_client()
+    client = await userbot_client(uid)
     if client is None:
         return await message.answer("❌ Avval akkauntga kiring.")
     try:
@@ -1645,43 +1793,43 @@ async def dest_handler(message: Message, state: FSMContext):
     username = getattr(entity, "username", None)
     stored = "@" + username if username else str(entity.id)
     data = load_data()
-    data["settings"]["dest"] = stored
-    data["settings"]["dest_title"] = channel_title(entity)
+    rec = get_user(uid)
+    rec["settings"]["dest"] = stored
+    rec["settings"]["dest_title"] = channel_title(entity)
     save_data(data)
     await state.clear()
     await message.answer(
         f"✅ Manzil saqlandi: <b>{_esc(channel_title(entity))}</b>",
-        reply_markup=panel_kb(),
+        reply_markup=panel_kb(uid),
     )
 
 
 @dp.callback_query(F.data == "cfg")
 async def cfg_cb(call: CallbackQuery, state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Shaxsiy bot", show_alert=True)
+    uid = call.from_user.id
     await state.clear()
     try:
-        await call.message.edit_text("⚙️ <b>Sozlamalar</b>", reply_markup=cfg_kb())
+        await call.message.edit_text("⚙️ <b>Sozlamalar</b>", reply_markup=cfg_kb(uid))
     except Exception:
-        await call.message.answer("⚙️ <b>Sozlamalar</b>", reply_markup=cfg_kb())
+        await call.message.answer("⚙️ <b>Sozlamalar</b>", reply_markup=cfg_kb(uid))
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("cfg:"))
 async def cfg_prompt(call: CallbackQuery, state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Shaxsiy bot", show_alert=True)
+    uid = call.from_user.id
     key = call.data.split(":", 1)[1]
     if key == "clean":
         data = load_data()
-        data["settings"]["clean_captions"] = not bool(data["settings"].get("clean_captions", True))
+        rec = get_user(uid)
+        rec["settings"]["clean_captions"] = not bool(rec["settings"].get("clean_captions", True))
         save_data(data)
-        enabled = "yoqildi" if data["settings"]["clean_captions"] else "o'chirildi"
+        enabled = "yoqildi" if rec["settings"]["clean_captions"] else "o'chirildi"
         await call.answer(f"🧽 Reklamani tozalash {enabled}")
         try:
-            await call.message.edit_text("⚙️ <b>Sozlamalar</b>", reply_markup=cfg_kb())
+            await call.message.edit_text("⚙️ <b>Sozlamalar</b>", reply_markup=cfg_kb(uid))
         except Exception:
-            await call.message.answer("⚙️ <b>Sozlamalar</b>", reply_markup=cfg_kb())
+            await call.message.answer("⚙️ <b>Sozlamalar</b>", reply_markup=cfg_kb(uid))
         return
     prompts = {
         "min_size": ("min_size", Form.min_size, "📦 Minimal video hajmini MB da yuboring (masalan 100):"),
@@ -1701,29 +1849,27 @@ async def cfg_prompt(call: CallbackQuery, state: FSMContext):
 @dp.message(Form.min_size)
 async def min_size_handler(message: Message, state: FSMContext):
     if await _save_numeric(message, state, "min_size_mb", 0, 4000):
-        await message.answer("✅ Minimal hajm yangilandi.", reply_markup=cfg_kb())
+        await message.answer("✅ Minimal hajm yangilandi.", reply_markup=cfg_kb(message.from_user.id))
 
 
 @dp.message(Form.delay)
 async def delay_handler(message: Message, state: FSMContext):
     if await _save_numeric(message, state, "send_delay_sec", 0, 120):
-        await message.answer("✅ Media oralig'i yangilandi.", reply_markup=cfg_kb())
+        await message.answer("✅ Media oralig'i yangilandi.", reply_markup=cfg_kb(message.from_user.id))
 
 
 @dp.message(Form.interval)
 async def interval_handler(message: Message, state: FSMContext):
     if await _save_numeric(message, state, "auto_interval_min", 5, 1440):
-        await message.answer("✅ Avto oraliq yangilandi.", reply_markup=cfg_kb())
+        await message.answer("✅ Avto oraliq yangilandi.", reply_markup=cfg_kb(message.from_user.id))
 
 
 async def _save_numeric(message: Message, state: FSMContext, key: str, low: int, high: int) -> bool:
-    if not is_owner(message.from_user.id):
-        await state.clear()
-        return False
+    uid = message.from_user.id
     raw = (message.text or "").strip()
     if raw == "/cancel":
         await state.clear()
-        await message.answer("✅ Bekor qilindi.", reply_markup=panel_kb())
+        await message.answer("✅ Bekor qilindi.", reply_markup=panel_kb(uid))
         return False
     try:
         value = int(raw)
@@ -1734,7 +1880,8 @@ async def _save_numeric(message: Message, state: FSMContext, key: str, low: int,
         await message.answer(f"⚠️ Qiymat {low} dan {high} gacha bo'lishi kerak. Qayta yuboring:")
         return False
     data = load_data()
-    data["settings"][key] = value
+    rec = get_user(uid)
+    rec["settings"][key] = value
     save_data(data)
     await state.clear()
     return True
@@ -1742,68 +1889,64 @@ async def _save_numeric(message: Message, state: FSMContext, key: str, low: int,
 
 @dp.message(Form.movies_topic)
 async def movies_topic_handler(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await state.clear()
-        return
+    uid = message.from_user.id
     raw = (message.text or "").strip()
     if raw == "/cancel":
         await state.clear()
-        return await message.answer("✅ Bekor qilindi.", reply_markup=panel_kb())
+        return await message.answer("✅ Bekor qilindi.", reply_markup=panel_kb(uid))
     if not raw or len(raw) > 100:
         return await message.answer("⚠️ 1–100 belgi kiriting:")
     data = load_data()
-    data["settings"]["movies_topic"] = raw
+    rec = get_user(uid)
+    rec["settings"]["movies_topic"] = raw
     save_data(data)
     await state.clear()
-    await message.answer(f"✅ Kinolar mavzusi: <b>{_esc(raw)}</b>", reply_markup=cfg_kb())
+    await message.answer(f"✅ Kinolar mavzusi: <b>{_esc(raw)}</b>", reply_markup=cfg_kb(uid))
 
 
 @dp.callback_query(F.data == "toggle_auto")
 async def toggle_auto_cb(call: CallbackQuery):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Shaxsiy bot", show_alert=True)
+    uid = call.from_user.id
     data = load_data()
-    data["settings"]["auto"] = not bool(data["settings"].get("auto"))
+    rec = get_user(uid)
+    rec["settings"]["auto"] = not bool(rec["settings"].get("auto"))
     save_data(data)
-    state_text = "yoqildi" if data["settings"]["auto"] else "o'chirildi"
+    state_text = "yoqildi" if rec["settings"]["auto"] else "o'chirildi"
     await call.answer(f"✅ Avto rejim {state_text}")
-    await show_panel(call.message, edit=True)
+    await show_panel(call.message, uid, edit=True)
 
 
 @dp.callback_query(F.data == "run_now")
 async def run_now_cb(call: CallbackQuery):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Shaxsiy bot", show_alert=True)
-    settings = load_data()["settings"]
+    uid = call.from_user.id
+    settings = user_settings(uid)
     if not settings.get("source") or not settings.get("dest"):
         return await call.answer("❌ Avval manba va manzil kanallarni tanlang", show_alert=True)
-    if not get_session():
+    if not get_session(uid):
         return await call.answer("❌ Avval akkauntga kiring", show_alert=True)
-    if _run_lock.locked():
+    if run_lock(uid).locked():
         return await call.answer("⏳ Forward allaqachon ketmoqda", show_alert=True)
     await call.answer("🚀 Boshlandi. Natijani shu chatga yozaman.")
-    spawn(run_forward(notify_chat_id=call.from_user.id))
+    spawn(run_forward(uid, notify_chat_id=uid))
 
 
 @dp.callback_query(F.data == "reset_stats")
 async def reset_stats_cb(call: CallbackQuery):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Shaxsiy bot", show_alert=True)
+    uid = call.from_user.id
     data = load_data()
-    data["stats"] = {}
+    rec = get_user(uid)
+    rec["stats"] = {}
     save_data(data)
     await call.answer("🧹 Tozalandi")
     try:
-        await call.message.edit_text("⚙️ <b>Sozlamalar</b>", reply_markup=cfg_kb())
+        await call.message.edit_text("⚙️ <b>Sozlamalar</b>", reply_markup=cfg_kb(uid))
     except Exception:
-        await call.message.answer("⚙️ <b>Sozlamalar</b>", reply_markup=cfg_kb())
+        await call.message.answer("⚙️ <b>Sozlamalar</b>", reply_markup=cfg_kb(uid))
 
 
 @dp.callback_query(F.data == "stats")
 async def stats_cb(call: CallbackQuery):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Shaxsiy bot", show_alert=True)
-    stats = load_data().get("stats", {})
+    stats = get_user(call.from_user.id).get("stats", {})
     if not stats:
         text = "📊 Hali statistika yo'q. «🚀 Forwardni boshlash» ni bosing."
     else:
@@ -1833,9 +1976,7 @@ async def stats_cb(call: CallbackQuery):
 
 @dp.message()
 async def fallback_handler(message: Message):
-    if not is_owner(message.from_user.id):
-        return
-    await message.answer("📋 Menyudan foydalaning.", reply_markup=panel_kb())
+    await message.answer("📋 Menyudan foydalaning.", reply_markup=panel_kb(message.from_user.id))
 
 
 # ================== RENDER / ISHGA TUSHISH ==================
@@ -1856,10 +1997,25 @@ async def start_web_server():
     return runner
 
 
+async def restore_clients():
+    """Ishga tushganda barcha saqlangan userbot sessionlarini tiklaydi."""
+    await asyncio.sleep(2)
+    for key, rec in list(all_users().items()):
+        if not (rec.get("userbot") or {}).get("session"):
+            continue
+        try:
+            client = await userbot_client(int(key))
+        except Exception:
+            logging.exception("Sessionni tiklab bo'lmadi (uid=%s)", key)
+            continue
+        if client is not None:
+            logging.info("Akkaunt ulandi (uid=%s)", key)
+
+
 async def main():
     runner = await start_web_server()
     auto_task = spawn(auto_loop())
-    spawn(userbot_client())
+    spawn(restore_clients())
     try:
         await dp.start_polling(bot)
     finally:
@@ -1868,7 +2024,7 @@ async def main():
             await auto_task
         except asyncio.CancelledError:
             pass
-        await close_client()
+        await close_all_clients()
         await runner.cleanup()
         await bot.session.close()
 
