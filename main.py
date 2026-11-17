@@ -62,6 +62,7 @@ def default_data():
             "clean_captions": True,
             "auto": False,
             "auto_interval_min": 30,
+            "send_delay_sec": 10,
         },
         "stats": {},
         "copied": {},
@@ -762,7 +763,51 @@ def document_filename(doc) -> str:
 
 
 # ================== SKANERLASH ==================
-async def scan_source(client, source, min_size: int, on_progress=None):
+def message_topic_id(message):
+    """Forum xabarining mavzu ID si (General mavzuda None)."""
+    header = getattr(message, "reply_to", None)
+    if header is None:
+        return None
+    top = getattr(header, "reply_to_top_id", None)
+    if top:
+        return int(top)
+    if getattr(header, "forum_topic", False):
+        return int(getattr(header, "reply_to_msg_id", 0) or 0) or None
+    return None
+
+
+async def fetch_source_topics(client, peer):
+    """Manba forumning mavzu nomlari: {topic_id: title}."""
+    titles = {}
+    offset_topic = offset_id = 0
+    offset_date = None
+    for _page in range(30):
+        if _stop_event.is_set():
+            raise ForwardStopped()
+        res = await client(functions.messages.GetForumTopicsRequest(
+            peer=peer, offset_date=offset_date, offset_id=offset_id,
+            offset_topic=offset_topic, limit=100, q=None,
+        ))
+        topics = getattr(res, "topics", None) or []
+        added = 0
+        for topic in topics:
+            if not isinstance(topic, types.ForumTopic):
+                continue
+            if topic.id in titles:
+                continue
+            titles[topic.id] = str(topic.title or "").strip()
+            added += 1
+        if added == 0 or len(topics) < 100:
+            break
+        last = topics[-1]
+        offset_topic = int(last.id)
+        offset_id = int(getattr(last, "top_message", 0) or 0)
+        offset_date = getattr(last, "date", None)
+    titles.pop(1, None)  # General mavzu — nomi bo'yicha emas, umumiy mavzuga
+    return titles
+
+
+async def scan_source(client, source, min_size: int, on_progress=None, topic_titles=None):
     items = []
     seen_docs = set()
     scanned = 0
@@ -782,10 +827,14 @@ async def scan_source(client, source, min_size: int, on_progress=None):
         header = " ".join(lines[:3])
         name, _, _ = parse_media_title(first_line or document_filename(doc))
         _, season, episode = parse_media_title(header or first_line or document_filename(doc))
-        if not name:
-            name = fallback_name(caption, document_filename(doc))
-        if looks_random_name(name):
-            name = ""
+        if topic_titles is not None:
+            # Manba mavzuli: nom caption'dan emas, manbadagi mavzu nomidan olinadi.
+            name = str(topic_titles.get(message_topic_id(message)) or "").strip()[:120]
+        else:
+            if not name:
+                name = fallback_name(caption, document_filename(doc))
+            if looks_random_name(name):
+                name = ""
         items.append({
             "msg_id": message.id,
             "grouped_id": message.grouped_id,
@@ -941,6 +990,7 @@ async def run_forward(notify_chat_id=None):
         min_size = min_mb * 1024 * 1024
         movies_topic = str(settings.get("movies_topic") or "Kinolar").strip() or "Kinolar"
         clean_captions = bool(settings.get("clean_captions", True))
+        send_delay = max(0, int(settings.get("send_delay_sec", 10) or 0))
 
         items = []
         scanned_count = 0
@@ -971,9 +1021,25 @@ async def run_forward(notify_chat_id=None):
                     f"{min_mb} MB dan katta video: <b>{found}</b> ta"
                 )
 
+            # Manba mavzuli (forum) bo'lsa, manzilda ham o'sha mavzu nomlari ochiladi.
+            topic_titles = None
+            if bool(getattr(source, "forum", False)):
+                await set_status("🗂 Manba mavzulari olinmoqda…")
+                try:
+                    topic_titles = await fetch_source_topics(client, source)
+                except ForwardStopped:
+                    raise
+                except Exception:
+                    logging.warning("Manba mavzularini olib bo'lmadi", exc_info=True)
+                    topic_titles = {}
+                if not topic_titles:
+                    topic_titles = None
+
             await set_status("📤 Manba kanal skanerlanmoqda…")
             try:
-                items, scanned_count = await scan_source(client, source, min_size, scan_progress)
+                items, scanned_count = await scan_source(
+                    client, source, min_size, scan_progress, topic_titles=topic_titles,
+                )
             except ForwardStopped:
                 raise
             except Exception as exc:
@@ -1000,7 +1066,8 @@ async def run_forward(notify_chat_id=None):
                     r["msg_id"],
                 ))
 
-            for key, records in groups.items():
+            group_list = list(groups.items())
+            for gi, (key, records) in enumerate(group_list):
                 if _stop_event.is_set():
                     stopped = True
                     break
@@ -1016,7 +1083,8 @@ async def run_forward(notify_chat_id=None):
                 if was_created:
                     created_topics += 1
 
-                for batch in chunk_albums(records):
+                batches = chunk_albums(records)
+                for bi, batch in enumerate(batches):
                     if _stop_event.is_set():
                         stopped = True
                         break
@@ -1039,6 +1107,17 @@ async def run_forward(notify_chat_id=None):
                             f"📤 Yuborilmoqda…\n✅ Yuborildi: <b>{done}</b> ta\n"
                             f"🏷 Mavzu: {_esc(topic_title)}"
                         )
+                    # Akkaunt spam blokiga tushmasligi uchun har media orasida tanaffus.
+                    has_more = bi < len(batches) - 1 or gi < len(group_list) - 1
+                    if has_more and send_delay > 0:
+                        await set_status(
+                            f"⏳ Spam bo'lmasligi uchun {send_delay} soniya kutilyapti…\n"
+                            f"✅ Yuborildi: <b>{done}</b> ta\n"
+                            f"🏷 Mavzu: {_esc(topic_title)}"
+                        )
+                        if await _sleep_or_stop(send_delay):
+                            stopped = True
+                            break
                 if stopped:
                     break
         except ForwardStopped:
@@ -1109,6 +1188,7 @@ class Form(StatesGroup):
     min_size = State()
     movies_topic = State()
     interval = State()
+    delay = State()
 
 
 def panel_text():
@@ -1127,6 +1207,7 @@ def panel_text():
         f"📥 Manba: {_esc(settings.get('source_title') or settings.get('source') or 'tanlanmagan')}",
         f"📤 Manzil: {_esc(settings.get('dest_title') or settings.get('dest') or 'tanlanmagan')}",
         f"📦 Minimal hajm: {settings.get('min_size_mb', 100)} MB",
+        f"⏱ Media oralig'i: {settings.get('send_delay_sec', 10)} soniya",
         f"🧽 Reklamani tozalash: {cleaning}",
         f"🔁 Avto: {auto} (har {settings.get('auto_interval_min', 30)} daqiqa)",
     ]
@@ -1140,7 +1221,8 @@ def panel_text():
         ]
     lines += [
         "",
-        "Har bir kino nomi bo'yicha alohida mavzu ochiladi; o'sha nomdagi barcha qismlar shu mavzuga tushadi.",
+        "Manba mavzuli (forum) bo'lsa — mavzular o'sha nomlari bilan manzilga ko'chiriladi.",
+        "Manba mavzusiz bo'lsa — har bir kino nomi bo'yicha alohida mavzu ochiladi; o'sha nomdagi barcha qismlar shu mavzuga tushadi.",
         "Xabarlar akkauntning o'zi yuborgandek (forward yozuvisiz) ketadi.",
     ]
     return "\n".join(lines)
@@ -1187,6 +1269,7 @@ def cfg_kb():
     cleaning = "🟢 yoqilgan" if settings.get("clean_captions", True) else "🔴 o'chirilgan"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"📦 Minimal hajm: {settings.get('min_size_mb', 100)} MB", callback_data="cfg:min_size")],
+        [InlineKeyboardButton(text=f"⏱ Media oralig'i: {settings.get('send_delay_sec', 10)} s", callback_data="cfg:delay")],
         [InlineKeyboardButton(text=f"🎬 Bo'sh nom uchun mavzu: {settings.get('movies_topic', 'Kinolar')}", callback_data="cfg:movies_topic")],
         [InlineKeyboardButton(text=f"🧽 Reklamani tozalash: {cleaning}", callback_data="cfg:clean")],
         [InlineKeyboardButton(text=f"🔁 Avto oraliq: {settings.get('auto_interval_min', 30)} daqiqa", callback_data="cfg:interval")],
@@ -1602,6 +1685,7 @@ async def cfg_prompt(call: CallbackQuery, state: FSMContext):
         return
     prompts = {
         "min_size": ("min_size", Form.min_size, "📦 Minimal video hajmini MB da yuboring (masalan 100):"),
+        "delay": ("send_delay_sec", Form.delay, "⏱ Har bir media orasidagi tanaffusni soniyada yuboring (0–120, masalan 10):"),
         "movies_topic": ("movies_topic", Form.movies_topic, "🎬 Nomi aniqlanmagan fayllar uchun mavzu nomini yuboring (masalan Kinolar):"),
         "interval": ("interval", Form.interval, "🔁 Avto tekshiruv oralig'ini daqiqada yuboring (kamida 5):"),
     }
@@ -1618,6 +1702,12 @@ async def cfg_prompt(call: CallbackQuery, state: FSMContext):
 async def min_size_handler(message: Message, state: FSMContext):
     if await _save_numeric(message, state, "min_size_mb", 0, 4000):
         await message.answer("✅ Minimal hajm yangilandi.", reply_markup=cfg_kb())
+
+
+@dp.message(Form.delay)
+async def delay_handler(message: Message, state: FSMContext):
+    if await _save_numeric(message, state, "send_delay_sec", 0, 120):
+        await message.answer("✅ Media oralig'i yangilandi.", reply_markup=cfg_kb())
 
 
 @dp.message(Form.interval)
